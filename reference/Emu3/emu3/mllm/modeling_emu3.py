@@ -65,14 +65,15 @@ def chunked_lm_head_cross_entropy(
     V = lm_head_weight.shape[0]
     device = hidden_states.device
 
-    # Use the same dtype as the model activations (bf16 with --bf16, fp32 otherwise).
-    # F.linear preserves hidden_states.dtype, so no explicit cast needed.
-    comp_dtype = hidden_states.dtype
+    # Use float32 for logsumexp accumulation — bf16 precision causes gradient
+    # noise that stalls NPU training (loss plateaus while GPU continues to decrease).
+    # F.linear preserves hidden_states.dtype, so cast to float32 for the reduction.
+    comp_dtype = torch.float
 
     running_max = torch.full((N,), -float("inf"), device=device, dtype=comp_dtype)
     for i in range(0, V, chunk_size):
         chunk_w = lm_head_weight[i : i + chunk_size]
-        chunk_l = F.linear(hidden_states, chunk_w)  # [N, chunk] — already in comp_dtype
+        chunk_l = F.linear(hidden_states, chunk_w).float()  # [N, chunk]
         running_max = torch.maximum(running_max, chunk_l.max(dim=-1, keepdim=False)[0])
 
     lse = torch.zeros(N, device=device, dtype=comp_dtype)
@@ -80,7 +81,7 @@ def chunked_lm_head_cross_entropy(
 
     for i in range(0, V, chunk_size):
         chunk_w = lm_head_weight[i : i + chunk_size]
-        chunk_l = F.linear(hidden_states, chunk_w)  # [N, chunk]
+        chunk_l = F.linear(hidden_states, chunk_w).float()  # [N, chunk]
         lse += (chunk_l - running_max.unsqueeze(-1)).exp().sum(dim=-1)
 
         in_chunk = (labels >= i) & (labels < i + chunk_size)
