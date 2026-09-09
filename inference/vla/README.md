@@ -32,7 +32,7 @@ export VLA_VLM_MODEL="/path/to/logs/train_nuplan_6va_v0.2_multi_node"
 export VLA_NORM_STATS="/path/to/configs/normalizer_navsim_trainval/norm_stats.json"
 
 # 可选配置
-export VLA_TOKEN_YAML="data/navsim/processed_data/scene_files/scene_filter/navtest.yaml"
+export VLA_TOKEN_YAML="inference/navsim/navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml"
 export VLA_NUM_WORKERS=12
 export VLA_BATCH_SIZE=1
 ```
@@ -74,7 +74,7 @@ paths:
   action_tokenizer: /path/to/pretrained_models/fast
   vlm_model: /path/to/logs/train_nuplan_6va_v0.2_multi_node
   norm_stats: /path/to/configs/normalizer_navsim_trainval/norm_stats.json
-  token_yaml: data/navsim/processed_data/scene_files/scene_filter/navtest.yaml
+  token_yaml: inference/navsim/navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml
 ```
 
 3. 运行脚本时指定配置文件：

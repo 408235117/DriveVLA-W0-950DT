@@ -133,13 +133,34 @@ pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https
 
 # Install core dependencies
 pip install -r requirements.txt
-pip install "transformers[torch]"
 
 # Install training-related dependencies
 pip install deepspeed          # Distributed training
 pip install scipy              # Scientific computing
 pip install tensorboard==2.14.0  # Visualization
 pip install wandb              # Experiment tracking
+```
+
+### Conda Environment Setup for Ascend
+
+```bash
+# Create Conda environment
+conda create -n drivevla python=3.10
+conda activate drivevla
+
+# Install PyTorch + torch_npu (CANN 8.5.1)
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+pip install torch_npu==2.7.1.post4
+
+# Install core dependencies
+pip install -r requirements_ascend.txt
+
+# Install training-related dependencies
+pip install deepspeed          # Distributed training
+pip install scipy              # Scientific computing
+pip install tensorboard==2.14.0  # Visualization
+pip install wandb              # Experiment tracking
+pip install mindstudio-probe
 ```
 
 ### Testing
