@@ -132,7 +132,7 @@ class ActionTokenizer:
         
         # Decode the token IDs to continuous actions and convert to torch tensor
         actions = self.decode_token_ids_to_actions(np.array(token_ids))
-        return torch.tensor(actions, dtype=torch.float64)
+        return torch.tensor(actions, dtype=torch.float32)
 
 
     @property

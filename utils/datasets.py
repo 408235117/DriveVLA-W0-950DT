@@ -783,6 +783,9 @@ class Emu3DrivingVAVADataset(Emu3SFTDataset):
 
             # action expert 需要的continous action
             sample["action"] = torch.tensor(action_tokens, dtype=torch.float)
+            # ⚠️  These keys are NOT accepted by Emu3MoE.forward() and are stripped by
+            # LoggingTrainer/WeightedSamplerTrainer.compute_loss via _VAVA_EXTRA_KEYS.
+            # If you add a new non-model key here, update _VAVA_EXTRA_KEYS in utils/train_moe.py.
             sample["pre_action"] = torch.tensor(np.array(action[0:self.cur_idx]), dtype=torch.float)
             sample["cmd"] = self.prompt2vec[prompt]
 
@@ -1153,6 +1156,11 @@ class Emu3DrivingVAVA_AR_Dataset(Emu3DrivingVAVADataset):
             ], dim=0)
 
         # 输出字典（仅保留必要字段）
+        # ⚠️  Non-model keys (vlm_input_ids, vlm_attention_mask, vlm_labels,
+        # action_input_ids, pre_action, cmd, token) are stripped by
+        # LoggingTrainer/WeightedSamplerTrainer.compute_loss via _VAVA_EXTRA_KEYS.
+        # If you add a new key that isn't in Emu3MoE.forward(), update
+        # _VAVA_EXTRA_KEYS in utils/train_moe.py.
         out = {
             "input_ids": action_fixed,
             "vlm_input_ids": full["input_ids"],

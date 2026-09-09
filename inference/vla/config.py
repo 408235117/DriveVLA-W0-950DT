@@ -85,7 +85,7 @@ class Config:
                 "action_tokenizer": None,
                 "vlm_model": None,
                 "norm_stats": None,
-                "token_yaml": "data/navsim/processed_data/scene_files/scene_filter/navtest.yaml",
+                "token_yaml": "inference/navsim/navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml",
             },
             "model": {
                 "model_max_length": 1400,

@@ -5,14 +5,142 @@ Combines Qwen-VL's multimodal capabilities with VLA action prediction
 """
 import os
 import sys
+import hashlib
+import json
 import logging
 import pathlib
 import pickle
+import random
+import numpy as np
 from pathlib import Path
 import torch
 import transformers
-from typing import Dict
+from typing import Dict, List, Optional
 from collections import defaultdict
+from torch.utils.data import SequentialSampler, RandomSampler
+
+# ---------------------------------------------------------------------------
+# Device detection: NPU > CUDA > CPU  (override via DEVICE env var)
+# ---------------------------------------------------------------------------
+_device_override = os.environ.get("DEVICE", "auto")
+
+if _device_override == "npu":
+    import torch_npu  # noqa: F401 — will raise ImportError if missing
+    _npu_available = torch.npu.is_available()
+    if not _npu_available:
+        raise RuntimeError("DEVICE=npu set but no NPU detected (torch.npu.is_available()=False)")
+    _device_type = "npu"
+
+elif _device_override == "cuda":
+    _device_type = "cuda"
+
+elif _device_override == "cpu":
+    _device_type = "cpu"
+
+else:
+    # "auto" — import torch_npu quietly; failure is fine, fall back to cuda/cpu
+    try:
+        import torch_npu  # noqa: F401
+        _npu_available = torch.npu.is_available()
+    except Exception:
+        _npu_available = False
+    _device_type = "npu" if _npu_available else ("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility helpers (mirrors train_moe.py — PRECISION_ALIGNMENT.md)
+# ---------------------------------------------------------------------------
+
+def device_synchronize():
+    if _device_type == "npu":
+        torch.npu.synchronize()
+    elif _device_type == "cuda":
+        torch.cuda.synchronize()
+
+
+def device_empty_cache():
+    if _device_type == "npu":
+        torch.npu.empty_cache()
+    elif _device_type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def device_manual_seed_all(seed: int):
+    if _device_type == "npu":
+        torch.npu.manual_seed_all(seed)
+    elif _device_type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+
+def set_reproducibility(seed: int, deterministic: bool = True):
+    """Strict reproducibility setup for cross-platform (NPU vs GPU) comparison.
+
+    Mirrors the msprobe.pytorch.seed_all() approach — see PRECISION_ALIGNMENT.md.
+    """
+    # Python-level hash seed — must be set BEFORE any dict/set operations
+    os.environ.setdefault("PYTHONHASHSEED", str(seed))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    device_manual_seed_all(seed)
+
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        if _device_type == "cuda":
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cuda.matmul.allow_tf32 = False
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            # NCCL deterministic communication (GPU)
+            os.environ.setdefault("NCCL_DETERMINISTIC", "TRUE")
+            os.environ.setdefault("NCCL_CROSS_NIC", "1")
+        # HCCL (NPU) deterministic communication
+        os.environ.setdefault("HCCL_DETERMINISTIC", "TRUE")
+        # NPU non-saturation mode: ensure overflow → Inf/NaN (matches GPU default)
+        os.environ.setdefault("INF_NAN_MODE_ENABLE", "1")
+
+    return seed
+
+
+def disable_model_dropout(model: torch.nn.Module) -> None:
+    """Disable all dropout layers for deterministic precision comparison.
+
+    Walks the module tree and sets p=0 on every Dropout/DropoutNd instance.
+    Mirrors msprobe.pytorch.seed_all(rm_dropout=True) behavior.
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd):
+            module.p = 0.0
+            print(f"[Reproducibility] Dropout disabled: {name}")
+
+
+def compute_batch_hash(inputs: Dict) -> str:
+    """Compute a deterministic SHA256 hash of a batch for cross-platform comparison.
+
+    Each tensor is converted float32 → CPU numpy → tobytes() for bit-identical
+    hashing across NPU and GPU platforms (PRECISION_ALIGNMENT.md Phase 4.1).
+
+    Keys are sorted to guarantee deterministic ordering.  Non-tensor values
+    (None, lists of tensors) are handled explicitly.
+    """
+    h = hashlib.sha256()
+    for key in sorted(inputs.keys()):
+        val = inputs[key]
+        h.update(key.encode())
+        if isinstance(val, torch.Tensor):
+            h.update(val.detach().float().cpu().numpy().tobytes())
+        elif val is None:
+            h.update(b"<NONE>")
+        elif isinstance(val, (list, tuple)):
+            for v in val:
+                if isinstance(v, torch.Tensor):
+                    h.update(v.detach().float().cpu().numpy().tobytes())
+                else:
+                    h.update(str(v).encode())
+        else:
+            h.update(str(val).encode())
+    return h.hexdigest()
+
 
 # Add paths to import Qwen-VL components
 qwen_vl_path = Path(__file__).parent.parent / "reference" / "Qwen2.5-VL" / "qwen-vl-finetune"
@@ -68,6 +196,34 @@ class RossTrainer(Trainer):
         self._acc_n = 0
         self._micro_in_accum = 0  # 当前累积里的 micro-step 计数
 
+        # Data hash logging for cross-platform (NPU vs GPU) data-order verification
+        # PRECISION_ALIGNMENT.md Phase 4.1 — per-rank file so NPU and GPU can be diffed
+        self._hash_logfile = None
+        if getattr(self.args, 'log_data_hash', False):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            hash_dir = os.path.join(self.args.output_dir, 'data_hashes')
+            os.makedirs(hash_dir, exist_ok=True)
+            hash_path = os.path.join(hash_dir, f'rank{rank}.jsonl')
+            self._hash_logfile = open(hash_path, 'w')
+            rank0_print(f'[DataHash] Logging batch hashes to {hash_path}')
+
+    def _get_train_sampler(self, train_dataset=None) -> Optional[torch.utils.data.Sampler]:
+        """Override sampler to respect --dataloader_shuffle for deterministic reproducibility.
+
+        When dataloader_shuffle=False, use SequentialSampler instead of RandomSampler
+        so NPU and GPU see the same data order (PRECISION_ALIGNMENT.md Phase 2.3).
+        """
+        if train_dataset is None:
+            train_dataset = self.train_dataset
+        if train_dataset is None or not hasattr(train_dataset, '__len__'):
+            return None
+        if self.args.group_by_length:
+            return super()._get_train_sampler(train_dataset)
+        if getattr(self.args, 'dataloader_shuffle', True):
+            return RandomSampler(train_dataset)
+        else:
+            return SequentialSampler(train_dataset)
+
     def _log_mean_and_reset(self):
         if self._acc_n == 0:
             return
@@ -83,6 +239,17 @@ class RossTrainer(Trainer):
         self._acc_n = 0
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        # Data hash logging — compute BEFORE forward (the model can mutate inputs)
+        # PRECISION_ALIGNMENT.md Phase 4.1: diff hash files across NPU vs GPU
+        if self._hash_logfile is not None:
+            step = self.state.global_step
+            batch_hash = compute_batch_hash(inputs)
+            # Hash only 'index' for compact diff (the entire batch duplicates tensors
+            # already visible in the index trace, but we hashed the full batch)
+            record = {'step': step, 'hash': batch_hash}
+            self._hash_logfile.write(json.dumps(record) + '\n')
+            self._hash_logfile.flush()  # survive crashes
+
         loss = super().training_step(model, inputs, num_items_in_batch)
 
         # 累积 forward 写入的 _last_logs
@@ -146,11 +313,20 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
                 extract_action_hidden=True,
                 sd_model_path=model_args.sd_model_path,
             )
+    # Resolve attention implementation with device-aware fallback
+    # FA2 is CUDA-only; fall back to sdpa on NPU / other devices
+    attn_type = getattr(training_args, "attn_type", "fa2")
+    if attn_type == "fa2" and _device_type != "cuda":
+        attn_impl = "sdpa"
+        print(f"[Device] FA2 not available on {_device_type}, falling back to sdpa")
+    else:
+        attn_impl = attn_type
+
     model = model_class.from_pretrained(
             model_args.model_name_or_path,
             config=ross_cfg,
             cache_dir=training_args.cache_dir,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             trust_remote_code=True,
     )
@@ -277,20 +453,32 @@ def setup_vla_data_args(data_args, image_processor, model_type):
 
 def train():
     global local_rank
-    
+
     # Parse arguments
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    
+
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
-    
+
+    rank0_print(f"[Device] detected: {_device_type}")
+
+    # Strict reproducibility for cross-platform (NPU vs GPU) comparison
+    # Phase 2 + Phase 3 of PRECISION_ALIGNMENT.md
+    if training_args.deterministic:
+        set_reproducibility(training_args.seed, deterministic=True)
+        rank0_print(f"[Reproducibility] enabled (seed={training_args.seed})")
+
     rank0_print("="*50)
     rank0_print("Qwen-VL VLA Training Setup")
     rank0_print("="*50)
-    
+
     # Setup model and tokenizer (includes all training configuration)
     model, tokenizer, image_processor, model_type = setup_vla_model_and_tokenizer(model_args, training_args)
+
+    # Disable dropout for deterministic comparison (Phase 2.2)
+    if training_args.deterministic:
+        disable_model_dropout(model)
     
     # Setup data
     data_args = setup_vla_data_args(data_args, image_processor, model_type)

@@ -32,7 +32,7 @@ logs_path     = f'/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu/data/navsim/navsim_logs
 dataset_path  = "/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu/data/navsim/processed_data"
 output_path   = "/mnt/nvme0n1p1/yingyan.li/repo/VLA_Emu/data/navsim/processed_data/meta"
 vq_dir        = f"{dataset_path}/{split}_vq_codes_256_144/"
-yaml_file     = f'data/navsim/processed_data/scene_files/scene_filter/{scene_filter}.yaml'
+yaml_file     = f'inference/navsim/navsim/navsim/planning/script/config/common/train_test_split/scene_filter/{scene_filter}.yaml'
 output_file_name = f"navsim_emu_vla_256_144_{split}_pre_1s.pkl"
 
 os.makedirs(output_path, exist_ok=True)

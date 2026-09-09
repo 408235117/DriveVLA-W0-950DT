@@ -27,7 +27,7 @@ class WeightedSamplerTrainer(Trainer):
     def get_train_dataloader(self):
         # 从 train_dataset 中获取 sample_weights
         sample_weights = torch.tensor(
-            self.train_dataset.sample_weights, dtype=torch.double
+            self.train_dataset.sample_weights, dtype=torch.float32
         )
         # 用 sample_weights 构建 WeightedRandomSampler
         sampler = WeightedRandomSampler(

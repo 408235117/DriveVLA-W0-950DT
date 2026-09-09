@@ -1,0 +1,30 @@
+#
+# Additional dependencies for Ascend NPU support.
+#
+# Usage (after `conda activate drivevla`):
+#   pip install -r requirements_ascend.txt
+#
+# ─── torch_npu ───────────────────────────────────────────────────────
+# Must match the installed CANN toolkit version.
+# CANN 8.5.1 → torch 2.7.1 → torch_npu 2.7.1.post4
+#
+# Install torch first, then torch_npu:
+#   pip install torch==2.7.1 torchvision==0.20.1 torchaudio==2.7.1 \
+#     --index-url https://download.pytorch.org/whl/cu128
+#   pip install torch_npu==2.7.1.post4
+#
+# After installing, verify:
+#   python -c "import torch, torch_npu; print(torch.npu.is_available())"
+#   → True
+#
+
+# ─── CANN toolkit (system-level, not pip) ────────────────────────────
+# Download CANN 8.5.1 from https://www.hiascend.com/software/cann/community
+# Install per your OS, then source the env:
+#   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+# ─── optional but recommended for NPU training ──────────────────────
+transformers[torch]==4.44.0
+tiktoken==0.6.0
+pillow
+gradio==4.44.0

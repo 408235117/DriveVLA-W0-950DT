@@ -40,7 +40,7 @@ torchrun \
   --adam_beta2 0.95 \
   --adam_epsilon 1e-6 \
   --bf16 True \
-  --tf32 True \
+  --tf32 False \
   --data_path ${DATAPATH} \
   --freeze_vlm False \
   --max_steps 10000 \

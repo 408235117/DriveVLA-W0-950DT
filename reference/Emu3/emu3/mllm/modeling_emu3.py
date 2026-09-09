@@ -27,10 +27,148 @@ from typing import List, Optional, Tuple, Union
 
 import torch, json
 import os
+import time
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+
+_NPU_EVENT_OK = False
+if hasattr(torch, 'npu') and torch.npu.is_available():
+    try:
+        _test = torch.npu.Event(enable_timing=True)
+        del _test
+        _NPU_EVENT_OK = True
+    except (TypeError, RuntimeError, AttributeError):
+        pass
+
+
+def _timing_event_start():
+    """Start a GPU-accurate timer using CUDA/NPU events.
+
+    Returns an opaque handle for _timing_event_end(). Events record GPU
+    timestamps without CPU-GPU sync, eliminating the measurement artifact
+    that sync() introduces on microsecond-scale operations like embedding.
+
+    Falls back to CPU perf_counter on platforms without event support.
+    """
+    if torch.cuda.is_available():
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return ('cuda', start, end)
+    elif _NPU_EVENT_OK:
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        return ('npu', start, end)
+    elif hasattr(torch, 'npu') and torch.npu.is_available():
+        # NPU available but events don't support enable_timing — fall back
+        # to sync-based wall-clock timing (stable, just slightly noisy on cheap ops).
+        torch.npu.synchronize()
+        return ('sync', time.perf_counter(), None)
+    else:
+        return ('cpu', time.perf_counter(), None)
+
+
+def _timing_event_end(handle) -> float:
+    """End the timer and return elapsed seconds (GPU time, or wall-clock for sync fallback)."""
+    kind = handle[0]
+    if kind == 'cpu':
+        return time.perf_counter() - handle[1]
+    if kind == 'sync':
+        torch.npu.synchronize()
+        return time.perf_counter() - handle[1]
+    _, start, end = handle
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / 1000.0  # ms → s
+
+
+def chunked_lm_head_cross_entropy(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    labels: torch.Tensor,
+    chunk_size: int = 8192,
+    ignore_index: int = -100,
+    weight: torch.Tensor = None,
+) -> torch.Tensor:
+    """Chunked lm_head projection + cross-entropy for large vocabularies.
+
+    Never materialises the full [N, V] logits tensor — instead iterates
+    over the vocab dimension in chunks, computing lm_head projection
+    on-the-fly for each chunk.  Peak intermediate is [N, chunk_size]
+    instead of [N, V] (~335 MiB vs ~3.8 GiB for a 5120-long sequence).
+
+    Accepts both 2-D [N, H] and 3-D [B, S, H] hidden_states.  For 3-D
+    input, F.linear handles non-contiguous strides natively, and we flatten
+    its contiguous output instead of the input — avoiding the redundant
+    copy that .reshape(-1, H) would force on a non-contiguous slice.
+
+    A two-pass strategy avoids numerical-precision pitfalls:
+      1. Find the global maximum over every vocab entry.
+      2. Compute logsumexp (using the stable max from pass 1) and
+         gather the logit at each label's position.
+
+    Args:
+        hidden_states: [N, H] or [B, S, H] input to the lm_head (already shifted).
+        lm_head_weight: [V, H] weight matrix of the output projection.
+        labels: [N] target indices or ignore_index.
+        chunk_size: vocab-dimension chunk size.
+        ignore_index: index to mask out.
+        weight: optional [V] class-weight vector.
+    """
+    # Accept 3-D input (e.g. hidden_states[:, :-1, :]) without forcing a
+    # contiguous copy.  F.linear handles non-contiguous strides; we flatten
+    # its contiguous output instead.
+    if hidden_states.ndim == 3:
+        B, S, H = hidden_states.shape
+        # Leave hidden_states as-is (non-contiguous view is fine for F.linear).
+        # We'll flatten the F.linear output below.
+        N = B * S
+    else:
+        N, H = hidden_states.shape
+    V = lm_head_weight.shape[0]
+    device = hidden_states.device
+
+    # Use the same dtype as the model activations (bf16 with --bf16, fp32 otherwise).
+    # F.linear preserves hidden_states.dtype, so no explicit cast needed.
+    comp_dtype = hidden_states.dtype
+
+    running_max = torch.full((N,), -float("inf"), device=device, dtype=comp_dtype)
+    for i in range(0, V, chunk_size):
+        chunk_w = lm_head_weight[i : i + chunk_size]
+        chunk_l = F.linear(hidden_states, chunk_w)  # [B, S, chunk] or [N, chunk]
+        if hidden_states.ndim == 3:
+            chunk_l = chunk_l.reshape(-1, chunk_l.size(-1))  # view, not copy (F.linear output is contiguous)
+        running_max = torch.maximum(running_max, chunk_l.max(dim=-1, keepdim=False)[0])
+
+    lse = torch.zeros(N, device=device, dtype=comp_dtype)
+    label_logit = torch.zeros(N, device=device, dtype=comp_dtype)
+
+    for i in range(0, V, chunk_size):
+        chunk_w = lm_head_weight[i : i + chunk_size]
+        chunk_l = F.linear(hidden_states, chunk_w)  # [B, S, chunk] or [N, chunk]
+        if hidden_states.ndim == 3:
+            chunk_l = chunk_l.reshape(-1, chunk_l.size(-1))  # view, not copy
+        lse += (chunk_l - running_max.unsqueeze(-1)).exp().sum(dim=-1)
+
+        in_chunk = (labels >= i) & (labels < i + chunk_size)
+        if in_chunk.any():
+            local_idx = labels[in_chunk] - i
+            label_logit[in_chunk] = chunk_l[in_chunk, local_idx]
+
+    lse = lse.log() + running_max  # [N]
+    nll = lse - label_logit
+
+    if weight is not None:
+        w = weight[labels.clamp(min=0)]
+        w[labels == ignore_index] = 0
+        nll = nll * w
+
+    mask = labels != ignore_index
+    return nll[mask].mean() if mask.any() else nll.sum() * 0
 import numpy as np
 
 from transformers.activations import ACT2FN
@@ -767,6 +905,8 @@ EMU3_ATTENTION_CLASSES = {
 class Emu3DecoderLayer(nn.Module):
     def __init__(self, config: Emu3Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.config = config
         self.hidden_size = config.hidden_size
         self.dropout = nn.Dropout(config.attention_dropout)
         self.self_attn = EMU3_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
@@ -774,6 +914,9 @@ class Emu3DecoderLayer(nn.Module):
         self.mlp = Emu3MLP(config)
         self.input_layernorm = Emu3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Emu3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # ponytail: per-submodule timing accumulator, dict of str→float seconds
+        self._submodule_times = {}
 
     def forward(
         self,
@@ -804,11 +947,17 @@ class Emu3DecoderLayer(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
 
+        _timing = getattr(self.config, 'log_submodule_time', False) and self.training
+        if _timing:
+            _ev_total = _timing_event_start()
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        if _timing:
+            _ev_attn = _timing_event_start()
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -819,12 +968,21 @@ class Emu3DecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = residual + self.dropout(hidden_states)
+        if _timing:
+            self._submodule_times['self_attn'] = self._submodule_times.get('self_attn', 0.0) + _timing_event_end(_ev_attn)
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if _timing:
+            _ev_mlp = _timing_event_start()
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + self.dropout(hidden_states)
+        if _timing:
+            self._submodule_times['mlp'] = self._submodule_times.get('mlp', 0.0) + _timing_event_end(_ev_mlp)
+
+        if _timing:
+            self._submodule_times['total'] = self._submodule_times.get('total', 0.0) + _timing_event_end(_ev_total)
 
         outputs = (hidden_states,)
 
@@ -980,6 +1138,9 @@ class Emu3Model(Emu3PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        # ponytail: per-submodule timing accumulator
+        self._submodule_times = {}
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1006,6 +1167,8 @@ class Emu3Model(Emu3PreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        _timing = getattr(self.config, 'log_submodule_time', False) and self.training
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
@@ -1039,7 +1202,11 @@ class Emu3Model(Emu3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if inputs_embeds is None:
+            if _timing:
+                _ev_embed = _timing_event_start()
             inputs_embeds = self.embed_tokens(input_ids)
+            if _timing:
+                self._submodule_times['embed'] = self._submodule_times.get('embed', 0.0) + _timing_event_end(_ev_embed)
 
         if self._use_flash_attention_2:
             # 2d mask is passed through the layers
@@ -1099,7 +1266,11 @@ class Emu3Model(Emu3PreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        if _timing:
+            _ev_norm = _timing_event_start()
         hidden_states = self.norm(hidden_states)
+        if _timing:
+            self._submodule_times['norm'] = self._submodule_times.get('norm', 0.0) + _timing_event_end(_ev_norm)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1469,9 +1640,12 @@ class Emu3MoE(Emu3PreTrainedModel):
         
         # Output head (same as Emu3ForCausalLM)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
         # Initialize weights and apply final processing
         self.post_init()
+
+        # ponytail: per-submodule timing accumulator
+        self._submodule_times = {}
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1522,7 +1696,9 @@ class Emu3MoE(Emu3PreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
+        _timing = getattr(self.config, 'log_submodule_time', False) and self.training
+
         # Decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1556,37 +1732,52 @@ class Emu3MoE(Emu3PreTrainedModel):
             # flow matching loss
             loss_action = F.mse_loss(noise - action, velo_pred)
 
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
-        logits = logits.float()
-
         loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            if self.use_weight:
-                weights = torch.ones(self.config.vocab_size)
-                vision_token_range = range(self.bov_token_id,self.eov_token_id+1)
-                weights[vision_token_range] = self.vision_loss_weight
-                loss_fct = CrossEntropyLoss(weight=weights.to(logits.device))
+            # Shift labels: tokens < n predict n
+            shift_labels = labels[..., 1:].contiguous().view(-1)
 
-            else:
-                loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            
-            loss = loss_fct(shift_logits, shift_labels)
+            # Chunked lm-head + loss — never materialises [N, V] logits.
+            # The full logits tensor for vocab_size=184k is ~3.8 GiB per
+            # copy; this replaces both that and the log-softmax with a
+            # chunked scan over the vocab dimension (peak ~170 MiB with
+            # chunk_size=8192).
+            # Pass 3-D [B, S-1, H] directly — the non-contiguous slice
+            # is free (no copy), and chunked_lm_head_cross_entropy
+            # flattens F.linear's contiguous output instead.
+            hidden_shifted = hidden_states[:, :-1, :]
+
+            weight = None
+            if self.use_weight:
+                weight = torch.ones(self.config.vocab_size, device=hidden_states.device)
+                weight[self.bov_token_id : self.eov_token_id + 1] = self.vision_loss_weight
+
+            if _timing:
+                _ev_lm = _timing_event_start()
+            loss = chunked_lm_head_cross_entropy(
+                hidden_shifted, self.lm_head.weight, shift_labels, weight=weight,
+            )
+            if _timing:
+                self._submodule_times['lm_head+loss'] = self._submodule_times.get('lm_head+loss', 0.0) + _timing_event_end(_ev_lm)
             if action is not None and self.action_experts:
                 loss += loss_action * self.vision_loss_weight
-            # loss = loss_action
+
+            # Placeholder for the return path — the Trainer only reads .loss
+            # during training, never .logits.
+            logits = torch.empty(0, device=hidden_states.device)
+
+        else:
+            # Inference / no labels: compute full logits for generation.
+            if self.config.pretraining_tp > 1:
+                lm_head_slices = self.lm_head.weight.split(
+                    self.vocab_size // self.config.pretraining_tp, dim=0,
+                )
+                logits = [F.linear(hidden_states, lm_head_slices[i])
+                          for i in range(self.config.pretraining_tp)]
+                logits = torch.cat(logits, dim=-1)
+            else:
+                logits = self.lm_head(hidden_states)
+            logits = logits.float()
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -1718,6 +1909,16 @@ class Emu3MoE(Emu3PreTrainedModel):
             z = z - dt * velo_pred
         
         return z
+
+    def reset_submodule_times(self) -> None:
+        """Clear all per-submodule timing accumulators across the module tree.
+
+        Called by the trainer after each logging interval so per-interval sums
+        don't bleed into the next interval.
+        """
+        for module in self.modules():
+            if hasattr(module, '_submodule_times'):
+                module._submodule_times = {}
 
 # ============================================================================
 # Emu3Pi0 Model - Pi0.5 style Action Expert Integration

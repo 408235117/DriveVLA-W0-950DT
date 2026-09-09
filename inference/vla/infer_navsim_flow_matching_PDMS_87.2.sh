@@ -22,7 +22,7 @@ fi
 export VLA_ACTION_TOKENIZER="${VLA_ACTION_TOKENIZER:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/pretrained_models/fast}"
 export VLA_VLM_MODEL="${VLA_VLM_MODEL:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/logs/train_nuplan_6va_v0.2_multi_node}"
 export VLA_NORM_STATS="${VLA_NORM_STATS:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/configs/normalizer_navsim_trainval/norm_stats.json}"
-export VLA_TOKEN_YAML="${VLA_TOKEN_YAML:-data/navsim/processed_data/scene_files/scene_filter/navtest.yaml}"
+export VLA_TOKEN_YAML="${VLA_TOKEN_YAML:-inference/navsim/navsim/navsim/planning/script/config/common/train_test_split/scene_filter/navtest.yaml}"
 
 # 推理参数（可通过环境变量覆盖）
 export EMU_HUB="${EMU_HUB:-/mnt/vdb1/shuyao.shang/VLA_Emu_Huawei/logs/train_navsim_pi0_vava_from_nuplan_ft}"

@@ -1,5 +1,8 @@
-transformers==4.44.0
+transformers[torch]==4.44.0
 tiktoken==0.6.0
-flash-attn==2.5.7
 pillow
 gradio==4.44.0
+
+# flash-attn is CUDA-only; skip on NPU (--device npu falls back to sdpa)
+--no-build-isolation
+flash-attn==2.5.7
