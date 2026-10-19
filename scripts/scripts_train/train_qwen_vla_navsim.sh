@@ -70,7 +70,10 @@ MIN_PIXELS=12544
 FUTURE_NUMS=8
 CUR_FRAME_IDX=3
 ACTION_DIM=3
-USE_PREVIOUS_ACTIONS=true
+# The ROSS forward asserts exactly 2 action segments. With cur_frame_idx > 0,
+# enabling history adds two more (pre-user + cur-user) and trips the assert
+# (modeling_qwen2_5_vl_ross.py:335-336). Keep false unless the model is patched.
+USE_PREVIOUS_ACTIONS=false
 TUNE_MM_LLM=true
 TUNE_MM_MLP=true
 TUNE_MM_VISION=true
@@ -124,7 +127,7 @@ Data / loss:
   --future_nums <n>            (8)
   --cur_frame_idx <n>          (3; window is -3..+8)
   --action_dim <n>             (3)
-  --use_previous_actions <b>   (true)
+  --use_previous_actions <b>   (false)
   --tune_mm_llm <b>            (true)
   --tune_mm_mlp <b>            (true)
   --tune_mm_vision <b>         (true)
