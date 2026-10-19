@@ -22,7 +22,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from decord import VideoReader
+try:
+    from decord import VideoReader
+except ImportError:  # no aarch64 wheels; unused on the image-only VLA path
+    VideoReader = None
 # from torchcodec.decoders import VideoDecoder  # Commented out due to compatibility issues
 import transformers
 

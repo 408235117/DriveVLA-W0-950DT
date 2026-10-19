@@ -46,7 +46,9 @@ safetensors
 diffusers               # no version pinned anywhere in the repo; pin after a smoke test
 einops==0.8.1
 scipy                   # FAST action tokenizer (scipy.fft dct/idct)
-decord                  # imported unconditionally by qwenvl/dataset/data_qwen_vla.py
+# decord is NOT required: it has no aarch64 wheels, and the VLA image path
+# never uses VideoReader. Its imports in qwenvl/dataset/{data_qwen_vla,rope2d}.py
+# are guarded.
 
 # --- optional, CUDA only ---
 # qwenvl/train/trainer.py imports flash_attn unconditionally, so a CUDA run
