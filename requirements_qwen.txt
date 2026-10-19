@@ -8,14 +8,26 @@
 # install transformers==4.44.0 (Emu3 path): it has no qwen2_5_vl module and
 # cannot load Qwen2.5-VL. The editable checkout below provides 4.56.0.
 #
-# Install torch for your platform FIRST (version differs by accelerator):
-#   CUDA: see SETUP.md          (torch 2.4.0 + cu124)
-#   NPU:  CANN 8.5.1 (system-level; source .../ascend-toolkit/set_env.sh),
-#         then torch 2.7.1 + torch_npu 2.7.1.post4 — see requirements_ascend.txt
+# The torch stack below is the Ascend NPU build. CUDA users: replace those
+# four lines with torch==2.4.0 / torchvision==0.19.0 / torchaudio==2.4.0
+# from the cu124 index, and drop torch_npu (see SETUP.md).
+#
+# CANN 8.5.1 is system-level, not pip. Install it and source the env before
+# using torch_npu:
+#   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# Verify:
+#   python -c "import torch, torch_npu; print(torch.npu.is_available())"  # True
+#
 # DeepSpeed's ZeRO CPU offload JIT-builds CPUAdam, so a C++ toolchain (g++) is
 # required; ninja/psutil/einops come with the deepspeed wheel.
 # Then, from the repo root:
 #   pip install -r requirements_qwen.txt
+
+# --- torch stack (Ascend NPU, CANN 8.5.1) ---
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+torch_npu==2.7.1.post4
 
 -e ./reference/transformers
 
