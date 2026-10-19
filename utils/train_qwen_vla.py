@@ -277,7 +277,7 @@ def rank0_print(*args):
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
     if trainer.deepspeed:
-        torch.cuda.synchronize()
+        device_synchronize()
         trainer.save_model(output_dir)
         return
 

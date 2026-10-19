@@ -352,7 +352,7 @@ class Qwen2_5_VLForConditionalGenerationROSS(Qwen2_5_VLForConditionalGeneration)
             posterior = self.vae.encode(raw_pixel_values_vae).latent_dist
             z_q = (posterior.sample() - self.vae_shift_factor) * self.vae_scaling_factor
 
-        with torch.amp.autocast('cuda', dtype=torch.float32):
+        with torch.amp.autocast(image_hidden.device.type, dtype=torch.float32):
             action_hidden = self.denoiser.ln_pre_a(action_hidden)
             image_hidden = self.denoiser.ln_pre(image_hidden)
             # image_hidden = image_hidden + self.denoiser.pos_embed

@@ -4,7 +4,10 @@ from typing import Dict, List, Optional, Sequence
 # import datasets
 import torch
 import torch.nn as nn
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except ImportError:  # CUDA-only; NPU runs with --attn_type sdpa
+    flash_attn_varlen_func = None
 from torch.utils.data import DataLoader, Sampler
 from torch.utils.data import RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -105,6 +108,11 @@ def _flash_attention_forward(
         deterministic (`bool`, *optional*):
             Determines if the deterministic option introduced in flash_attn>=2.4.1 is enabled.
     """
+    if flash_attn_varlen_func is None:
+        raise ImportError(
+            "flash_attn is not installed; fa2 attention is CUDA-only. "
+            "Use --attn_type sdpa on NPU."
+        )
     assert query_states.size(0) == key_states.size(0) == value_states.size(0) == 1
     query_states = query_states.squeeze(0)
     key_states = key_states.squeeze(0)

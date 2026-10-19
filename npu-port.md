@@ -188,6 +188,31 @@ for the image-only VLA path.
 
 ---
 
+## Step 5 — NPU runtime fixes (applied, not yet committed)
+
+Triggered by the first real launch on the NPU host:
+
+```
+ModuleNotFoundError: No module named 'flash_attn'
+  at qwenvl/train/trainer.py:7
+```
+
+Four fixes were applied so the training path can start on NPU and reach a
+forward/backward pass:
+
+| # | File | Change |
+|---|---|---|
+| 1 | [`qwenvl/train/trainer.py:7`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py#L7) | `flash_attn` import wrapped in `try/except ImportError` (`flash_attn_varlen_func = None`); `_flash_attention_forward` now raises a clear error only if `fa2` is actually used. `sdpa` runs without flash-attn. |
+| 2 | [`modeling_ross/denoiser_sd.py:22-32`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L22-L32) | `negative_prompt_path` default changed from the author's `/mnt/vdb1/...` path to `None`, resolved relative to `__file__` (`negative_prompt_sd15.pt` next to the module). Added `import os`. |
+| 3 | [`modeling_ross/denoiser_sd.py:81,195`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L81) | Both `torch.load(...)` calls now pass `map_location="cpu"` so the embeddings load on a machine without CUDA. |
+| 4 | [`modeling_qwen2_5_vl_ross.py:355`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py#L355) | `torch.amp.autocast('cuda', ...)` → `torch.amp.autocast(image_hidden.device.type, ...)` (`npu` on Ascend, `cuda` on GPU). |
+| 5 | [`utils/train_qwen_vla.py:280`](utils/train_qwen_vla.py#L280) | `torch.cuda.synchronize()` in `safe_save_model_for_hf_trainer` → existing `device_synchronize()` helper. |
+
+Verification so far: all four files pass `python -m py_compile`. The fixes have
+**not** yet been exercised by a real NPU training step.
+
+---
+
 ## Current status
 
 ### Verified locally
@@ -201,6 +226,7 @@ for the image-only VLA path.
 - `diffusers 0.41.0` still exports every symbol the custom UNet imports
   (`FusedAttnProcessor2_0`, `USE_PEFT_BACKEND`, `FromOriginalModelMixin`,
   `get_mid_block`, `retrieve_timesteps`, `rescale_noise_cfg`).
+- The four NPU runtime fixes from Step 5 pass `py_compile`.
 
 ### Verified on the remote NPU host
 
@@ -212,26 +238,23 @@ for the image-only VLA path.
 
 ---
 
-## Remaining port work (not yet applied)
+## Remaining port work
 
-These are the known blockers between a successful install and a running step.
-None of them has been changed yet.
+The four blockers from Step 5 are fixed. What remains:
 
 | # | File:line | Problem | Planned fix |
 |---|---|---|---|
-| 1 | [`qwenvl/train/trainer.py:7`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py#L7) | `from flash_attn...` is unconditional; NPU has no flash-attn, so import fails before training | wrap in `try/except ImportError`; raise only if `fa2` is actually selected |
-| 2 | [`modeling_ross/denoiser_sd.py:24`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L24) | `negative_prompt_path` hard-coded to `/mnt/vdb1/yingyan.li/...`; `torch.load` fails on first forward | default to `None` and resolve `os.path.join(os.path.dirname(__file__), "negative_prompt_sd15.pt")` |
-| 3 | [`modeling_qwen2_5_vl_ross.py:355`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py#L355) | `torch.amp.autocast('cuda', ...)` on NPU | derive device type from the tensor: `torch.amp.autocast(image_hidden.device.type, ...)` |
-| 4 | [`utils/train_qwen_vla.py:280`](utils/train_qwen_vla.py#L280) | `torch.cuda.synchronize()` in the DeepSpeed save path | call the existing `device_synchronize()` helper |
-| 5 | [`inference/qwen/inference_action_navsim_vava.py:100-104`](inference/qwen/inference_action_navsim_vava.py#L100-L104) | inference hardcodes `backend='nccl'` and `torch.cuda` | use `hccl` / `torch.npu` when NPU; only needed for evaluation |
-| 6 | `use_previous_actions=true` | ROSS asserts 2 action segments | currently disabled; if history is required, generalize the assert/extraction to handle 4 segments |
+| 1 | [`inference/qwen/inference_action_navsim_vava.py:100-104`](inference/qwen/inference_action_navsim_vava.py#L100-L104) | inference hardcodes `backend='nccl'` and `torch.cuda` | use `hccl` / `torch.npu` when NPU; only needed for evaluation |
+| 2 | `use_previous_actions=true` | ROSS asserts 2 action segments | currently disabled; if history is required, generalize the assert/extraction to handle 4 segments |
 
 Open questions to validate at runtime:
 
 - `diffusers 0.41.0` vs the custom UNet copy: symbol names exist, but
   `get_mid_block`/attention-processor signatures were not exercised.
 - DeepSpeed ZeRO-3 CPU offload + `torch_npu` in this exact combination.
-- `torch.amp.autocast` behavior on NPU after fix #3.
+- `torch.amp.autocast('npu', ...)` behavior after fix #4 of Step 5.
+- First forward: whether the synthetic 504×280 images produce exactly 180
+  tokens with the actual remote image processor.
 
 ---
 
@@ -244,6 +267,10 @@ Open questions to validate at runtime:
 | [`tools/synth/synth_qwen_vla_data.py`](tools/synth/synth_qwen_vla_data.py) | new | 2 |
 | [`reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/data_qwen_vla.py`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/data_qwen_vla.py) | modified | 4 |
 | [`reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/rope2d.py`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/rope2d.py) | modified | 4 |
+| [`reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py) | modified | 5 |
+| [`reference/transformers/.../modeling_ross/denoiser_sd.py`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py) | modified | 5 |
+| [`reference/transformers/.../modeling_qwen2_5_vl_ross.py`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py) | modified | 5 |
+| [`utils/train_qwen_vla.py`](utils/train_qwen_vla.py) | modified | 5 |
 | [`npu-port.md`](npu-port.md) | new | this document |
 
 Generated but not committed: `logs/synth_qwen_data/` (gitignored).

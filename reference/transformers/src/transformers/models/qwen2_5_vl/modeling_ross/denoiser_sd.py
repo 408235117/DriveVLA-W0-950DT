@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 import torch
@@ -21,9 +22,13 @@ class RossStableDiffusionXOmni(nn.Module):
         z_channel,
         mlp_depth,
         n_patches=576,
-        negative_prompt_path="/mnt/vdb1/yingyan.li/repo/VLA/reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/negative_prompt_sd15.pt",
+        negative_prompt_path=None,
     ):
         super().__init__()
+        if negative_prompt_path is None:
+            negative_prompt_path = os.path.join(
+                os.path.dirname(__file__), "negative_prompt_sd15.pt"
+            )
         self.ln_pre = nn.LayerNorm(z_channel, elementwise_affine=False)
         self.pos_embed = nn.Parameter(torch.zeros(1, n_patches, z_channel), requires_grad=True)
         # torch.nn.init.normal_(self.pos_embed, std=.02)
@@ -73,7 +78,7 @@ class RossStableDiffusionXOmni(nn.Module):
         noisy_model_input = self.noise_scheduler.add_noise(target, noise, timesteps)
 
         # Obtain hidden states
-        encoder_hidden_states = torch.load(self.negative_prompt_path).to(target.device).to(target.dtype)
+        encoder_hidden_states = torch.load(self.negative_prompt_path, map_location="cpu").to(target.device).to(target.dtype)
         encoder_hidden_states = encoder_hidden_states.repeat(bsz, 1, 1)
 
         # interpolate
@@ -187,7 +192,7 @@ class RossStableDiffusionXOmni(nn.Module):
 
         # 0. Obtain hidden states
         # 0.1 Negative prompt embeddings
-        prompt_embeds = torch.load(self.negative_prompt_path).to(z.device).to(z.dtype).repeat(z.shape[0], 1, 1)
+        prompt_embeds = torch.load(self.negative_prompt_path, map_location="cpu").to(z.device).to(z.dtype).repeat(z.shape[0], 1, 1)
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
