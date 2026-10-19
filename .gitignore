@@ -103,6 +103,10 @@ tools/debug/
 
 data
 
+# The vendored transformers source contains a `data/` package; keep it tracked.
+!reference/transformers/src/transformers/data/
+!reference/transformers/src/transformers/data/**
+
 debug_output/
 
 *.pyc

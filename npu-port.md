@@ -213,6 +213,36 @@ Verification so far: all four files pass `python -m py_compile`. The fixes have
 
 ---
 
+## Step 6 — Missing `transformers.data` package (applied, not yet committed)
+
+The next launch got past the flash-attn guard and failed importing the Trainer:
+
+```
+ModuleNotFoundError: No module named 'transformers.data'
+  at reference/transformers/src/transformers/trainer.py:59
+```
+
+Root cause: the vendored transformers checkout is a subset and omits the
+upstream `data/` package entirely (`git log --all -- .../transformers/data`
+returns nothing). `trainer.py:59` imports `DataCollator`,
+`DataCollatorWithPadding`, and `default_data_collator` from it.
+
+Fix:
+
+- Added [`data/data_collator.py`](reference/transformers/src/transformers/data/data_collator.py)
+  verbatim from upstream `transformers v4.56.0` (101 KB).
+- Added [`data/__init__.py`](reference/transformers/src/transformers/data/__init__.py)
+  as a minimal subset exporting only the data-collator symbols. Upstream's
+  `__init__.py` also imports `.metrics` and `.processors`, which the Qwen path
+  never uses; including them would pull in unused code/dependencies.
+- Added a `.gitignore` negation for the vendored `data/` directory; the root
+  `data` rule (meant for the project's dataset dir) was matching it.
+
+`data_collator.py` imports only `..models.bert`, `..tokenization_utils_base`,
+and `..utils`, all present in the vendored tree. Both files pass `py_compile`.
+
+---
+
 ## Current status
 
 ### Verified locally
@@ -227,6 +257,7 @@ Verification so far: all four files pass `python -m py_compile`. The fixes have
   (`FusedAttnProcessor2_0`, `USE_PEFT_BACKEND`, `FromOriginalModelMixin`,
   `get_mid_block`, `retrieve_timesteps`, `rescale_noise_cfg`).
 - The four NPU runtime fixes from Step 5 pass `py_compile`.
+- The added `transformers/data` files pass `py_compile`.
 
 ### Verified on the remote NPU host
 
@@ -271,6 +302,9 @@ Open questions to validate at runtime:
 | [`reference/transformers/.../modeling_ross/denoiser_sd.py`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py) | modified | 5 |
 | [`reference/transformers/.../modeling_qwen2_5_vl_ross.py`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py) | modified | 5 |
 | [`utils/train_qwen_vla.py`](utils/train_qwen_vla.py) | modified | 5 |
+| [`reference/transformers/src/transformers/data/__init__.py`](reference/transformers/src/transformers/data/__init__.py) | new | 6 |
+| [`reference/transformers/src/transformers/data/data_collator.py`](reference/transformers/src/transformers/data/data_collator.py) | new (upstream v4.56.0) | 6 |
+| [`.gitignore`](.gitignore) | modified | 6 |
 | [`npu-port.md`](npu-port.md) | new | this document |
 
 Generated but not committed: `logs/synth_qwen_data/` (gitignored).
