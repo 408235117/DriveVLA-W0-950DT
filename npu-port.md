@@ -136,8 +136,10 @@ bash scripts/scripts_train/train_qwen_vla_navsim.sh \
     --save_steps 100000 --save_total_limit 1
 ```
 
-Note: `RossTrainer` uses a plain `RandomSampler`, not a `DistributedSampler`
-(`utils/train_qwen_vla.py:210-225`), so every rank iterates all 256 samples.
+Note: on the 8-rank NPU run the remote pkl contained 4,096 scenes and the
+per-rank dataloader length was 256 (= 4096 / 8 / batch 2), so the ranks were
+sharded. The local generator default is 256 scenes; regenerate with
+`--num_scenes 4096` if you want the same sample count.
 
 ---
 
@@ -208,12 +210,11 @@ forward/backward pass:
 | 4 | [`modeling_qwen2_5_vl_ross.py:355`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py#L355) | `torch.amp.autocast('cuda', ...)` → `torch.amp.autocast(image_hidden.device.type, ...)` (`npu` on Ascend, `cuda` on GPU). |
 | 5 | [`utils/train_qwen_vla.py:280`](utils/train_qwen_vla.py#L280) | `torch.cuda.synchronize()` in `safe_save_model_for_hf_trainer` → existing `device_synchronize()` helper. |
 
-Verification so far: all four files pass `python -m py_compile`. The fixes have
-**not** yet been exercised by a real NPU training step.
+Verification: these fixes were exercised by the successful 8-NPU run in Step 7.
 
 ---
 
-## Step 6 — Missing `transformers.data` package (applied, not yet committed)
+## Step 6 — Missing `transformers.data` package (committed as `67292e7`)
 
 The next launch got past the flash-attn guard and failed importing the Trainer:
 
@@ -243,6 +244,53 @@ and `..utils`, all present in the vendored tree. Both files pass `py_compile`.
 
 ---
 
+## Step 7 — First successful NPU training run
+
+8 × Ascend NPU, synthetic data, 20 optimizer steps:
+
+```bash
+bash scripts/scripts_train/train_qwen_vla_navsim.sh \
+    --data_path logs/synth_qwen_data/synth_navsim.pkl \
+    --data_root logs/synth_qwen_data/images \
+    --sd_model_path /mnt/sfs_turbo/models/stable-diffusion-v1-5 \
+    --model_name_or_path /mnt/sfs_turbo/models/Qwen2.5-VL-7B-Instruct \
+    --device npu --ngpus 8 --batch_size 2 \
+    --max_steps 20 --logging_steps 1 \
+    --save_steps 100000 --save_total_limit 1
+```
+
+Environment / model:
+
+- `torch 2.7.1+cpu`, `torch_npu 2.7.1.post4`, `transformers 4.56.0`
+- 9,238.5M params total, 9,154.8M trainable (7B LLM + vision + SD1.5 UNet)
+- script estimate: ~187.6 GiB optimizer + master weights (ZeRO-3 CPU offload)
+- dataset: 4,096 synthetic samples; per-rank dataloader length 256
+
+Trainer output:
+
+| Metric | Value |
+|---|---|
+| `train_runtime` | 304.88 s (includes the final checkpoint save) |
+| `train_samples_per_second` | **1.05** |
+| `train_steps_per_second` | **0.066** |
+| `train_loss` | 13.28 |
+| steady-state step time | **~8.4 s/step** (progress bar at 20/20 before saving) |
+| `ross_loss` | ~0.97–1.01, stable, no NaN |
+| `action_loss` | 19.8 → 7.6 (random labels — not a learning signal) |
+
+Notes:
+
+- The step time starts at ~12 s (warm-up) and settles at ~8.3–8.4 s/step.
+  The end-to-end 0.066 steps/s is dominated by checkpoint I/O, not compute.
+- Despite `--save_steps 100000`, the Trainer writes `checkpoint-20` at the end,
+  then the script writes the final model. The run dir reached **~137 GB**
+  (~18 GB final model + ~120 GB checkpoint with ZeRO optimizer state).
+  For throughput-only runs, delete the checkpoint or add a
+  `--save_strategy no` option (not exposed by the launcher yet).
+- `use_previous_actions=false` was accepted; the 2-segment assert passed.
+
+---
+
 ## Current status
 
 ### Verified locally
@@ -262,30 +310,30 @@ and `..utils`, all present in the vendored tree. Both files pass `py_compile`.
 ### Verified on the remote NPU host
 
 - `torch==2.7.1`, `torchvision==0.22.1`, `torchaudio==2.7.1`,
-  `torch_npu==2.7.1.post4` are resolvable from the Tsinghua mirror.
-- The first install failed on `decord`; fixed in Step 4.
-- **No successful end-to-end training run yet.** The next install must be
-  re-run from the updated `requirements_qwen.txt`.
+  `torch_npu==2.7.1.post4` installed; `torch.npu.is_available()` → True,
+  8 devices.
+- `transformers.data` + `transformers.trainer` import successfully after
+  Step 6 (no reinstall needed).
+- **20-step training on 8 NPU completed successfully** (Step 7): all four
+  fixes exercised, `ross_loss` stable around 1.0, model saved.
+- `diffusers 0.41.0` + the custom UNet, DeepSpeed ZeRO-3 CPU offload +
+  `torch_npu`, and `torch.amp.autocast('npu')` all worked at runtime.
+- The synthetic 504×280 images produced the expected 180-token grid.
 
 ---
 
 ## Remaining port work
 
-The four blockers from Step 5 are fixed. What remains:
+Core NPU training works (Step 7). What remains:
 
 | # | File:line | Problem | Planned fix |
 |---|---|---|---|
 | 1 | [`inference/qwen/inference_action_navsim_vava.py:100-104`](inference/qwen/inference_action_navsim_vava.py#L100-L104) | inference hardcodes `backend='nccl'` and `torch.cuda` | use `hccl` / `torch.npu` when NPU; only needed for evaluation |
 | 2 | `use_previous_actions=true` | ROSS asserts 2 action segments | currently disabled; if history is required, generalize the assert/extraction to handle 4 segments |
+| 3 | launcher | no way to disable checkpointing | add `--save_strategy`; a 20-step run otherwise writes ~137 GB including optimizer state |
 
-Open questions to validate at runtime:
-
-- `diffusers 0.41.0` vs the custom UNet copy: symbol names exist, but
-  `get_mid_block`/attention-processor signatures were not exercised.
-- DeepSpeed ZeRO-3 CPU offload + `torch_npu` in this exact combination.
-- `torch.amp.autocast('npu', ...)` behavior after fix #4 of Step 5.
-- First forward: whether the synthetic 504×280 images produce exactly 180
-  tokens with the actual remote image processor.
+Resolved by Step 7 (no longer open): `diffusers 0.41.0` UNet compatibility,
+DeepSpeed ZeRO-3 + `torch_npu`, device-aware autocast, and the 180-token grid.
 
 ---
 
