@@ -1,0 +1,43 @@
+# DriveVLA-W0 — Qwen2.5-VL VLA (ROSS) requirements
+#
+# Environment for:
+#   utils/train_qwen_vla.py
+#   inference/qwen/inference_action_navsim_vava.py
+#
+# This file REPLACES requirements.txt for the Qwen path. In particular, do not
+# install transformers==4.44.0 (Emu3 path): it has no qwen2_5_vl module and
+# cannot load Qwen2.5-VL. The editable checkout below provides 4.56.0.
+#
+# Install torch for your platform FIRST (version differs by accelerator):
+#   CUDA: see SETUP.md          (torch 2.4.0 + cu124)
+#   NPU:  CANN 8.5.1 (system-level; source .../ascend-toolkit/set_env.sh),
+#         then torch 2.7.1 + torch_npu 2.7.1.post4 — see requirements_ascend.txt
+# DeepSpeed's ZeRO CPU offload JIT-builds CPUAdam, so a C++ toolchain (g++) is
+# required; ninja/psutil/einops come with the deepspeed wheel.
+# Then, from the repo root:
+#   pip install -r requirements_qwen.txt
+
+-e ./reference/transformers
+
+# --- runtime / training ---
+deepspeed==0.17.6
+accelerate
+tensorboard
+# wandb                 # uncomment if you pass --report_to wandb
+numpy
+pillow
+pyyaml
+tqdm
+safetensors
+
+# --- Qwen2.5-VL + ROSS ---
+diffusers               # no version pinned anywhere in the repo; pin after a smoke test
+einops==0.8.1
+scipy                   # FAST action tokenizer (scipy.fft dct/idct)
+decord                  # imported unconditionally by qwenvl/dataset/data_qwen_vla.py
+
+# --- optional, CUDA only ---
+# qwenvl/train/trainer.py imports flash_attn unconditionally, so a CUDA run
+# needs it at HEAD. On NPU it cannot be installed; guard that import instead
+# of adding this line here.
+# flash-attn==2.6.1
