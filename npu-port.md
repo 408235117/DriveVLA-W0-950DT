@@ -291,6 +291,52 @@ Notes:
 
 ---
 
+## Step 8 — ROSS loss diagnosis
+
+The 20-step run logged `ross_loss` ≈ 0.97–1.01 with no downward trend. A
+diagnostic run and checkpoint inspection showed why that run was not a valid
+learning test.
+
+**First-run checkpoint inspection** (`checkpoint-20`, compared against the base
+weights):
+
+| Weight group | Result |
+|---|---|
+| LLM / ViT | changed (max ≈ 2.4e-4 / 1.2e-4) |
+| SD1.5 UNet | bit-identical to the original bf16 weights |
+| `denoiser.factor` | 6.6e29 (anomalous) |
+| `denoiser.factor_a` | 4e-10 |
+
+**Controlled 100-step diagnostic** (`lr=1e-4`, `warmup=10`, `save_strategy=no`,
+same seed/data):
+
+| Metric | Value |
+|---|---|
+| `train_runtime` | 806.98 s / 100 steps = **8.07 s/step** |
+| `train_samples_per_second` | **1.983** |
+| `train_loss` | 5.82 |
+| `ross_loss` | 0.0006–0.032, typical ~0.003, no divergence |
+| `action_loss` | 19.85 → ~4.8 |
+| UNet `conv_in.weight` | 8,934 / 11,520 elements changed, max 1.47e-3 |
+| UNet mid-attention | 384,613 / 1,638,400 elements changed, max 9.77e-4 |
+| `denoiser.factor` / `factor_a` | -5.0e-4 / 3.6e-4 (sane) |
+
+Conclusion:
+
+- The ROSS branch **does train**; its loss can drop to ~1e-3 on the synthetic
+  data. The 20-step run never gave it a usable learning rate (warmup 50 meant
+  the LR peaked at 2e-5 on the last step), and the UNet updates were below bf16
+  save resolution.
+- The first run's `factor=6.6e29` was not reproduced. Treat that checkpoint as
+  anomalous; if it recurs, restore the `ross_grad_clip` / NaN guards that
+  existed in `eb82f31` (they were removed from HEAD).
+- Use `lr` in the 5e-5–1e-4 range, `warmup_steps` 10–50, and several hundred
+  steps for real training. For throughput-only runs, `--save_strategy no`
+  avoids the 120 GB optimizer checkpoint (the final 18 GB model is still
+  written).
+
+---
+
 ## Current status
 
 ### Verified locally
@@ -331,6 +377,7 @@ Core NPU training works (Step 7). What remains:
 | 1 | [`inference/qwen/inference_action_navsim_vava.py:100-104`](inference/qwen/inference_action_navsim_vava.py#L100-L104) | inference hardcodes `backend='nccl'` and `torch.cuda` | use `hccl` / `torch.npu` when NPU; only needed for evaluation |
 | 2 | `use_previous_actions=true` | ROSS asserts 2 action segments | currently disabled; if history is required, generalize the assert/extraction to handle 4 segments |
 | 3 | launcher | no way to disable checkpointing | add `--save_strategy`; a 20-step run otherwise writes ~137 GB including optimizer state |
+| 4 | training recipe | 20 steps / warmup 50 is not a valid learning test | use lr 5e-5–1e-4, warmup 10–50, several hundred steps (Step 8) |
 
 Resolved by Step 7 (no longer open): `diffusers 0.41.0` UNet compatibility,
 DeepSpeed ZeRO-3 + `torch_npu`, device-aware autocast, and the 180-token grid.
