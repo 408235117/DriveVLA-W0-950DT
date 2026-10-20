@@ -10,6 +10,67 @@ reason for it, and what is still outstanding.
 
 ---
 
+## Accessing the NPU box
+
+| Item | Value |
+|---|---|
+| SSH alias | `ott9-a57` |
+| Host / user | `liteserver-hps-d235-00007.novalocal` / `root` |
+| Repository | `/mnt/sfs_turbo/lmc/DriveVLA-W0` |
+| tmux session | `lmc` (also `lmc-2`, `lmc-compile`) |
+| Conda env | `drivevla` — active only inside the `lmc` session |
+| Accelerators | 8 × Ascend NPU (`/dev/davinci0..7`) |
+| Qwen weights | `/mnt/sfs_turbo/models/Qwen2.5-VL-7B-Instruct` |
+| SD1.5 weights | `/mnt/sfs_turbo/models/stable-diffusion-v1-5` |
+| Synthetic data | `logs/synth_qwen_data` (4,096 scenes), `logs/synth_qwen_data_large` (8,192) |
+
+### Connect and attach
+
+```bash
+ssh ott9-a57
+tmux attach -t lmc
+```
+
+### Run a command without attaching
+
+```bash
+ssh ott9-a57 "tmux send-keys -t lmc 'cd /mnt/sfs_turbo/lmc/DriveVLA-W0 && python -c \"import torch; print(torch.__version__)\"' C-m"
+ssh ott9-a57 "tmux capture-pane -t lmc -p | tail -20"
+```
+
+For automation, `ssh -o BatchMode=yes ott9-a57 '<command>'` works (key auth is
+configured) and returns the command's stdout.
+
+### Environment caveat
+
+A plain non-interactive SSH shell is **not** the training environment:
+
+```text
+ssh ott9-a57 'which python'   -> /usr/bin/python   (3.11.6, no torch)
+```
+
+The `drivevla` env is active only inside the `lmc` tmux session
+(`which python` → `/usr/local/python3.12.13/bin/python`,
+`CONDA_PREFIX=/root/miniconda3/envs/drivevla`). Run Python/torch work through
+tmux, or use the exact interpreter path from inside that session.
+
+`/mnt/sfs_turbo` is shared with the SSH shell, so `git`, `ls`, `ps`, `du`, and
+file inspection can be done directly over SSH.
+
+### Verify the box
+
+```bash
+ssh ott9-a57 'ls /dev/davinci* | head; nproc'
+ssh ott9-a57 "tmux send-keys -t lmc 'python -c \"import torch, torch_npu; print(torch.__version__, torch.npu.is_available(), torch.npu.device_count())\"' C-m"
+```
+
+Expected: eight devices and `(2.7.1+cpu, True, 8)`.
+
+**Do not send `C-c`** to the `lmc` pane unless you intend to kill the running
+job — the session is shared.
+
+---
+
 ## Step 0 — Baseline audit (no code change)
 
 Entry point: [`utils/train_qwen_vla.py`](utils/train_qwen_vla.py).
