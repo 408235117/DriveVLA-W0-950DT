@@ -365,7 +365,11 @@ class Qwen2_5_VLForConditionalGenerationROSS(Qwen2_5_VLForConditionalGeneration)
         self._last_logs = {
             "action_loss": float(outputs.loss.detach().cpu()),
             "ross_loss": float(ross_loss.mean().detach().cpu()),
-        } 
+            # Gate diagnostics: values captured inside the denoiser forward,
+            # where ZeRO-3 has gathered them (see denoiser_sd.py).
+            "factor": self.denoiser._gate_values[0],
+            "factor_a": self.denoiser._gate_values[1],
+        }
 
         outputs.loss = outputs.loss + ross_loss.mean()
         

@@ -62,6 +62,14 @@ class RossStableDiffusionXOmni(nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(unet_path.replace("/unet", "/scheduler"))
 
     def forward(self, z, target, z_a=None):
+        # Gate diagnostics. Read here, inside the module forward, where ZeRO-3
+        # has gathered the params; reading these 0-dim scalars from outside
+        # (e.g. in the outer model or at save time) returns partitioned garbage.
+        self._gate_values = (
+            float(self.factor.detach().float().cpu()),
+            float(self.factor_a.detach().float().cpu()),
+        )
+
         # z: [B, C, H, W] LMM output features
         # target: [B, C, H*2, W*2] clean latent features (before 2x2 grouping)
 
