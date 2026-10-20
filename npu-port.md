@@ -337,6 +337,33 @@ Conclusion:
 
 ---
 
+## Step 9 — Larger-dataset confirmation (interrupted at 70/300)
+
+Regenerated 8,192 scenes / 98,304 images (455 MB) at
+`logs/synth_qwen_data_large`, then ran 300 steps with `lr=1e-4`,
+`warmup=10`, `save_strategy=no`.
+
+The run was **interrupted by SIGINT at step 70/300** (9:41 elapsed). Observed
+before the interrupt:
+
+| Metric | Value |
+|---|---|
+| `action_loss` | 20.39 → 5.21 |
+| `ross_loss` | 0.00055–0.0129, typical ~0.002 |
+| `grad_norm` | ~9.7 |
+| LR at step 70 | 9.02e-5 |
+| step time | 7.72 s/step |
+
+This confirms the 100-step diagnostic on a 2× larger dataset: the ROSS loss is
+stable, low (~2e-3), and three orders of magnitude below the first run's ~1.0.
+The run directory is empty because the process was killed before the final
+model save.
+
+To complete the full 300 steps, rerun `run_confirm.sh` on the host (or the
+equivalent command); the SIGINT came from the terminal, not the training code.
+
+---
+
 ## Current status
 
 ### Verified locally
