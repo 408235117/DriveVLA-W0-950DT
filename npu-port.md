@@ -41,6 +41,21 @@ ssh ott9-a57 "tmux capture-pane -t lmc -p | tail -20"
 For automation, `ssh -o BatchMode=yes ott9-a57 '<command>'` works (key auth is
 configured) and returns the command's stdout.
 
+### Launching runs — always use `tmux`
+
+**Launch every training/eval run inside the `lmc` tmux session. Do not use
+detached processes (`docker exec -d`, `nohup ... &`, background SSH jobs)
+unless explicitly told otherwise.** The session runs inside the training
+container with the env already active, and it is what the user monitors.
+
+```bash
+ssh ott9-a57 "tmux send-keys -t lmc 'cd /mnt/sfs_turbo/lmc/DriveVLA-W0 && bash run_100.sh 2>&1 | tee logs/run.log' C-m"
+ssh ott9-a57 "tmux capture-pane -t lmc -p | tail -20"
+```
+
+To stop a job, kill its processes (`pkill -f train_qwen_vla.py`) — do not send
+`C-c` to the shared pane.
+
 ### Environment caveat
 
 A plain non-interactive SSH shell is **not** the training environment:
