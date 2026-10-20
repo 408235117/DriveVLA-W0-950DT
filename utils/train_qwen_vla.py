@@ -330,6 +330,8 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             trust_remote_code=True,
     )
+    rank0_print(f"[GATE] after from_pretrained: factor={model.denoiser.factor.item():.6g} "
+                f"factor_a={model.denoiser.factor_a.item():.6g}")
     from diffusers import AutoencoderKL
     from reference.transformers.src.transformers.models.qwen2_5_vl.modeling_ross.unet_2d_condition import UNet2DConditionModel   
     model.vae = AutoencoderKL.from_pretrained(model_args.sd_model_path.replace("/unet", "/vae"), torch_dtype=model.dtype)
@@ -338,8 +340,12 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
     model.denoiser.unet = UNet2DConditionModel.from_pretrained(model_args.sd_model_path, torch_dtype=model.dtype)
     model.denoiser.unet.train()
     model.denoiser.unet.requires_grad_(True)
+    rank0_print(f"[GATE] after vae/unet assignment: factor={model.denoiser.factor.item():.6g} "
+                f"factor_a={model.denoiser.factor_a.item():.6g}")
 
     tokenizer, model, _ = check_and_add_vla_tokens(tokenizer, model)
+    rank0_print(f"[GATE] after vla tokens: factor={model.denoiser.factor.item():.6g} "
+                f"factor_a={model.denoiser.factor_a.item():.6g}")
     
     rank0_print(f"Loaded {model_class.__name__} from {model_args.model_name_or_path}")
 
@@ -399,6 +405,8 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
     for n, p in model.vae.named_parameters():
         p.requires_grad = False
     rank0_print("VAE: FROZEN")
+    rank0_print(f"[GATE] before Trainer: factor={model.denoiser.factor.item():.6g} "
+                f"factor_a={model.denoiser.factor_a.item():.6g}")
     
     def count(m):
         tot = sum(p.numel() for p in m.parameters())

@@ -62,14 +62,6 @@ class RossStableDiffusionXOmni(nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(unet_path.replace("/unet", "/scheduler"))
 
     def forward(self, z, target, z_a=None):
-        # Gate diagnostics. Read here, inside the module forward, where ZeRO-3
-        # has gathered the params; reading these 0-dim scalars from outside
-        # (e.g. in the outer model or at save time) returns partitioned garbage.
-        self._gate_values = (
-            float(self.factor.detach().float().cpu()),
-            float(self.factor_a.detach().float().cpu()),
-        )
-
         # z: [B, C, H, W] LMM output features
         # target: [B, C, H*2, W*2] clean latent features (before 2x2 grouping)
 
@@ -99,14 +91,27 @@ class RossStableDiffusionXOmni(nn.Module):
         if z_a is not None:
             z_a = self.mlp_a(z_a).unsqueeze(-1).unsqueeze(-1).contiguous()
 
+        cond = self.factor * z + self.factor_a * z_a if z_a is not None else self.factor * z
+
+        # Temporary diagnostics: gate values and the magnitudes they actually
+        # contribute. If |cond| is O(1) while |factor| is huge, the gate is
+        # harmless but frozen (GroupNorm normalizes the scale away).
+        self._gate_values = (
+            float(self.factor.detach().float().cpu()),
+            float(self.factor_a.detach().float().cpu()),
+            float(z.detach().float().abs().mean().cpu()),
+            float(z_a.detach().float().abs().mean().cpu()) if z_a is not None else -1.0,
+            float(cond.detach().float().abs().mean().cpu()),
+        )
+
         # Predict the noise residual
         model_pred = self.unet(
-            noisy_model_input, 
-            timesteps, 
-            encoder_hidden_states, 
-            class_labels=None, 
+            noisy_model_input,
+            timesteps,
+            encoder_hidden_states,
+            class_labels=None,
             return_dict=False,
-            z=self.factor * z + self.factor_a * z_a if z_a is not None else self.factor * z,
+            z=cond,
         )[0]
 
         if model_pred.shape[1] == 6:
