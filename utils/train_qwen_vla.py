@@ -332,6 +332,19 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
     )
     rank0_print(f"[GATE] after from_pretrained: factor={model.denoiser.factor.item():.6g} "
                 f"factor_a={model.denoiser.factor_a.item():.6g}")
+
+    # from_pretrained builds the model under init_empty_weights(), so the
+    # torch.tensor(0.) initial value of the two bare nn.Parameters is discarded
+    # and these missing keys are materialized from uninitialized memory
+    # (observed 1e16, 7e22, 1e34, 6.4e-33 across runs). PreTrainedModel's
+    # _init_weights does not cover bare Parameters, so restore the intended
+    # zero-init explicitly. See npu-port.md Step 11.
+    with torch.no_grad():
+        model.denoiser.factor.zero_()
+        model.denoiser.factor_a.zero_()
+    rank0_print(f"[GATE] zero-initialized: factor={model.denoiser.factor.item():.6g} "
+                f"factor_a={model.denoiser.factor_a.item():.6g}")
+
     from diffusers import AutoencoderKL
     from reference.transformers.src.transformers.models.qwen2_5_vl.modeling_ross.unet_2d_condition import UNet2DConditionModel   
     model.vae = AutoencoderKL.from_pretrained(model_args.sd_model_path.replace("/unet", "/vae"), torch_dtype=model.dtype)
