@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 WINDOW = 12
-CUR_IDX = 3
+PRE_SHIFT = 2  # pre_1s_* is anchored this many frames earlier (upstream: scene[i-2])
 IMG_W, IMG_H = 504, 280  # -> 18 x 10 = 180 tokens at 28 px/token
 
 
@@ -36,6 +36,16 @@ def make_image(path, scene, frame):
     y0 = (frame * 23) % (IMG_H - 20)
     draw.rectangle([x0, y0, x0 + 40, y0 + 20], fill=((255 - base), base, 128))
     img.save(path, quality=90)
+
+
+def anchor_back(seq, k):
+    """Shift a per-frame sequence k frames earlier, clamped at the first frame.
+
+    Mirrors the upstream generator (pickle_generation_navsim_pre_1s.py:143), which
+    sets pre_1s_* = scene[i-2][...]; result[i] == seq[i-k].
+    """
+    idx = [max(0, i - k) for i in range(len(seq))]
+    return [seq[i] for i in idx] if isinstance(seq, list) else seq[idx]
 
 
 def main():
@@ -72,11 +82,20 @@ def main():
                 "text": prompts,
                 "image": image_paths,
                 "action": actions,
-                "pre_1s_text": prompts,
-                "pre_1s_image": image_paths,
-                "pre_1s_action": actions.copy(),
+                "pre_1s_text": anchor_back(prompts, PRE_SHIFT),
+                "pre_1s_image": anchor_back(image_paths, PRE_SHIFT),
+                "pre_1s_action": anchor_back(actions, PRE_SHIFT),
             }
         )
+
+    # Self-check: pre_1s_* must be a shifted view of the window, not a copy of it.
+    # The loader reads both streams at cur_idx, so a copy would collapse the
+    # t -> t+1 objective in the ROSS branch into t -> t.
+    s = scenes[0]
+    assert s["pre_1s_image"] != s["image"], "pre_1s_image duplicates image"
+    for k in range(PRE_SHIFT, args.window):
+        assert s["pre_1s_image"][k] == s["image"][k - PRE_SHIFT], k
+        assert np.array_equal(s["pre_1s_action"][k], s["action"][k - PRE_SHIFT]), k
 
     with open(pkl_path, "wb") as f:
         pickle.dump(scenes, f)
