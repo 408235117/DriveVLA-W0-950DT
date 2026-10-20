@@ -56,6 +56,20 @@ ssh ott9-a57 "tmux capture-pane -t lmc -p | tail -20"
 To stop a job, kill its processes (`pkill -f train_qwen_vla.py`) — do not send
 `C-c` to the shared pane.
 
+### Change workflow
+
+Every code change that a run will use follows exactly one path:
+
+1. modify locally
+2. commit locally **only when the user says so** — never commit on your own
+3. push
+4. pull on the box
+5. run
+
+**Never copy files to the box** (`scp`, `rsync`, `tar | ssh`). A directly
+copied file leaves the box with an uncommitted working tree, so there is no
+record of what actually ran.
+
 ### Environment caveat
 
 A plain non-interactive SSH shell is **not** the training environment:
