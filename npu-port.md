@@ -84,7 +84,7 @@ Findings that drove the subsequent changes:
 | ROSS hardcodes a **10×18 = 180-token** image grid | `modeling_qwen2_5_vl_ross.py:68` (`n_patches=180`) and `:359` (`rearrange(... h=10, w=18)`). The default `max_pixels=28*28*576` produces 576 tokens for 16:9 images and crashes. |
 | ROSS asserts **exactly 2 image/action segments** | `modeling_qwen2_5_vl_ross.py:335-337`. `use_previous_actions=true` with `cur_frame_idx>0` adds two more action segments and trips the assert. The old launcher avoided this with `cur_frame_idx=0`, which silently suppressed history. |
 | Per-device batch must be **≥ 2** | `image_hidden[:, 0].squeeze()` at `:339` removes the batch dim when batch size is 1. |
-| Training requires **Stable Diffusion 1.5** | UNet at `denoiser_sd.py:41`, VAE at `modeling_qwen2_5_vl_ross.py:71-81`, scheduler at `denoiser_sd.py:55`; `--sd_model_path` must end in `/unet` because paths are derived with `.replace("/unet", ...)`. |
+| Training requires **Stable Diffusion 1.5** | UNet at `denoiser_sd.py:40`, VAE at `modeling_qwen2_5_vl_ross.py:71-81`, scheduler at `denoiser_sd.py:62`; `--sd_model_path` must end in `/unet` because paths are derived with `.replace("/unet", ...)`. |
 | `decord` has **no aarch64 wheel** | Imported unconditionally by `qwenvl/dataset/data_qwen_vla.py` and `rope2d.py`, but `VideoReader` is never used on the VLA path. |
 
 Image path resolution (`data_qwen_vla.py:391-424`): the pickle's
@@ -199,7 +199,7 @@ bash scripts/scripts_train/train_qwen_vla_navsim.sh \
 
 Note: on the 8-rank NPU run the remote pkl contained 4,096 scenes and the
 per-rank dataloader length was 256 (= 4096 / 8 / batch 2), so the ranks were
-sharded. The local generator default is 256 scenes; regenerate with
+sharded. The generator default is 64 scenes (`--num_scenes`); regenerate with
 `--num_scenes 4096` if you want the same sample count.
 
 ---
@@ -251,7 +251,7 @@ for the image-only VLA path.
 
 ---
 
-## Step 5 — NPU runtime fixes (applied, not yet committed)
+## Step 5 — NPU runtime fixes (committed as `2e40d2c`)
 
 Triggered by the first real launch on the NPU host:
 
@@ -260,13 +260,13 @@ ModuleNotFoundError: No module named 'flash_attn'
   at qwenvl/train/trainer.py:7
 ```
 
-Four fixes were applied so the training path can start on NPU and reach a
+Five fixes were applied so the training path can start on NPU and reach a
 forward/backward pass:
 
 | # | File | Change |
 |---|---|---|
 | 1 | [`qwenvl/train/trainer.py:7`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py#L7) | `flash_attn` import wrapped in `try/except ImportError` (`flash_attn_varlen_func = None`); `_flash_attention_forward` now raises a clear error only if `fa2` is actually used. `sdpa` runs without flash-attn. |
-| 2 | [`modeling_ross/denoiser_sd.py:22-32`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L22-L32) | `negative_prompt_path` default changed from the author's `/mnt/vdb1/...` path to `None`, resolved relative to `__file__` (`negative_prompt_sd15.pt` next to the module). Added `import os`. |
+| 2 | [`modeling_ross/denoiser_sd.py:25-31`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L25-L31) | `negative_prompt_path` default changed from the author's `/mnt/vdb1/...` path to `None`, resolved relative to `__file__` (`negative_prompt_sd15.pt` next to the module). Added `import os`. |
 | 3 | [`modeling_ross/denoiser_sd.py:81,195`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L81) | Both `torch.load(...)` calls now pass `map_location="cpu"` so the embeddings load on a machine without CUDA. |
 | 4 | [`modeling_qwen2_5_vl_ross.py:355`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py#L355) | `torch.amp.autocast('cuda', ...)` → `torch.amp.autocast(image_hidden.device.type, ...)` (`npu` on Ascend, `cuda` on GPU). |
 | 5 | [`utils/train_qwen_vla.py:280`](utils/train_qwen_vla.py#L280) | `torch.cuda.synchronize()` in `safe_save_model_for_hf_trainer` → existing `device_synchronize()` helper. |
@@ -388,6 +388,10 @@ Conclusion:
   data. The 20-step run never gave it a usable learning rate (warmup 50 meant
   the LR peaked at 2e-5 on the last step), and the UNet updates were below bf16
   save resolution.
+- **Caveat (added in Step 10):** the synthetic `pre_1s_*` streams were
+  byte-identical to the current-frame streams, so this objective was a
+  near-identity reconstruction rather than `t → t+1`. The ~1e-3 loss does not
+  demonstrate the intended ROSS task.
 - The first run's `factor=6.6e29` was not reproduced. Treat that checkpoint as
   anomalous; if it recurs, restore the `ross_grad_clip` / NaN guards that
   existed in `eb82f31` (they were removed from HEAD).
@@ -420,8 +424,60 @@ stable, low (~2e-3), and three orders of magnitude below the first run's ~1.0.
 The run directory is empty because the process was killed before the final
 model save.
 
+**Caveat (Step 10):** this run used the same degenerate pre/cur pairing as
+Step 8 — `pre_1s_image == image` in every scene. The low loss therefore
+reflects a near-identity reconstruction, not `t → t+1` prediction.
+
 To complete the full 300 steps, rerun `run_confirm.sh` on the host (or the
 equivalent command); the SIGINT came from the terminal, not the training code.
+
+---
+
+## Step 10 — Fix synthetic `pre_1s_*` and re-run (60 steps)
+
+Auditing the synthetic data against the upstream generator found that every
+scene had `pre_1s_image == image` and `pre_1s_action == action`:
+
+- [`synth_qwen_vla_data.py`](tools/synth/synth_qwen_vla_data.py) copied the current-frame lists into the `pre_1s_*` fields (now fixed at [:85-87](tools/synth/synth_qwen_vla_data.py#L85-L87), self-check at [:91-98](tools/synth/synth_qwen_vla_data.py#L91-L98)).
+- Upstream does not: [`pickle_generation_navsim_pre_1s.py:143-145`](tools/pickle_gen/pickle_generation_navsim_pre_1s.py#L143-L145) anchors `pre_1s_*` on `scene[i-2]`, and Phase 2 of that script explicitly repairs identical pairs ([:236](tools/pickle_gen/pickle_generation_navsim_pre_1s.py#L236), [:260-277](tools/pickle_gen/pickle_generation_navsim_pre_1s.py#L260-L277)).
+
+Because the ROSS branch conditions on the pre segment and reconstructs the
+current frame ([`modeling_qwen2_5_vl_ross.py:339-342`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl_ross.py#L339-L342)),
+the copy reduced the objective to "reconstruct the frame you conditioned on."
+
+Fix (`e988fef`): `pre_1s_*` is now the same window anchored `PRE_SHIFT = 2`
+frames earlier, with an assertion in the generator that fails if the pair
+collapses back to a copy.
+
+Verification (inside the training container, against the real dataset class):
+
+| Check | Result |
+|---|---|
+| `pre_1s_image == image` | 0 / 4096 and 0 / 8192 after regeneration |
+| shift alignment `pre[k] == image[k-2]` | all scenes |
+| schema / image paths / 180-token grid | unchanged, 0 violations |
+| ROSS segment asserts | image T=2, action T=2 |
+
+Regenerated `logs/synth_qwen_data` (4,096 scenes) and
+`logs/synth_qwen_data_large` (8,192) on the NPU host.
+
+60-step run on the corrected data (`logs/ross_short_20261020`, lr 1e-4,
+warmup 10, `save_strategy no`):
+
+| Metric | Value |
+|---|---|
+| `train_runtime` | 523.3 s = **8.72 s/step** |
+| `train_samples_per_second` | 1.835 |
+| `ross_loss` | 0.972 → ~1.0, **flat across all 60 steps** |
+| `action_loss` | 19.67 → ~5.0 |
+| `grad_norm` | 67 → ~9 |
+| final model | 18 GB |
+
+The corrected objective sits at the epsilon-prediction baseline (~1.0, i.e.
+predicting zero noise) and does not move within 60 steps. This confirms the
+pipeline on non-degenerate inputs but is **not** a learning result; the earlier
+~1e-3 losses were an artifact of the identity task. A few hundred steps are
+needed to tell whether the ROSS branch fits the real objective.
 
 ---
 
@@ -432,13 +488,15 @@ equivalent command); the SIGINT came from the terminal, not the training code.
 - Launcher parses (`bash -n`), `--help` works, missing-argument validation works.
 - Synthetic data: 256 scenes, correct pickle schema, image path resolution,
   504×280 → 180 tokens.
+- `pre_1s_*` is a 2-frame-shifted view of the window, not a copy (Step 10);
+  0 / 4096 and 0 / 8192 duplicate pairs after regeneration on the NPU host.
 - The vendored Qwen model/config/processor files are identical to upstream
   `transformers v4.56.0`; `trainer.py` differs by one import style and the
   Qwen `__init__.py` adds the ROSS module reference.
 - `diffusers 0.41.0` still exports every symbol the custom UNet imports
   (`FusedAttnProcessor2_0`, `USE_PEFT_BACKEND`, `FromOriginalModelMixin`,
   `get_mid_block`, `retrieve_timesteps`, `rescale_noise_cfg`).
-- The four NPU runtime fixes from Step 5 pass `py_compile`.
+- The five NPU runtime fixes from Step 5 pass `py_compile`.
 - The added `transformers/data` files pass `py_compile`.
 
 ### Verified on the remote NPU host
@@ -448,8 +506,10 @@ equivalent command); the SIGINT came from the terminal, not the training code.
   8 devices.
 - `transformers.data` + `transformers.trainer` import successfully after
   Step 6 (no reinstall needed).
-- **20-step training on 8 NPU completed successfully** (Step 7): all four
+- **20-step training on 8 NPU completed successfully** (Step 7): all five
   fixes exercised, `ross_loss` stable around 1.0, model saved.
+- **60-step training on 8 NPU with corrected synthetic data** completed
+  (Step 10): 8.72 s/step, ROSS loss flat at ~1.0, model saved.
 - `diffusers 0.41.0` + the custom UNet, DeepSpeed ZeRO-3 CPU offload +
   `torch_npu`, and `torch.amp.autocast('npu')` all worked at runtime.
 - The synthetic 504×280 images produced the expected 180-token grid.
@@ -464,8 +524,8 @@ Core NPU training works (Step 7). What remains:
 |---|---|---|---|
 | 1 | [`inference/qwen/inference_action_navsim_vava.py:100-104`](inference/qwen/inference_action_navsim_vava.py#L100-L104) | inference hardcodes `backend='nccl'` and `torch.cuda` | use `hccl` / `torch.npu` when NPU; only needed for evaluation |
 | 2 | `use_previous_actions=true` | ROSS asserts 2 action segments | currently disabled; if history is required, generalize the assert/extraction to handle 4 segments |
-| 3 | launcher | no way to disable checkpointing | add `--save_strategy`; a 20-step run otherwise writes ~137 GB including optimizer state |
-| 4 | training recipe | 20 steps / warmup 50 is not a valid learning test | use lr 5e-5–1e-4, warmup 10–50, several hundred steps (Step 8) |
+| 3 | launcher | no way to disable checkpointing | add `--save_strategy`; a 20-step run otherwise writes ~137 GB including optimizer state. The ad-hoc `run_confirm.sh` / `run_short.sh` already pass `--save_strategy no`, leaving only the 18 GB final model |
+| 4 | training recipe | 20 steps / warmup 50 is not a valid learning test | use lr 5e-5–1e-4, warmup 10–50, several hundred steps (Steps 8, 10); on corrected data the ROSS loss is still at baseline after 60 steps (Step 10) |
 
 Resolved by Step 7 (no longer open): `diffusers 0.41.0` UNet compatibility,
 DeepSpeed ZeRO-3 + `torch_npu`, device-aware autocast, and the 180-token grid.
@@ -478,7 +538,7 @@ DeepSpeed ZeRO-3 + `torch_npu`, device-aware autocast, and the 180-token grid.
 |---|---|---|
 | [`requirements_qwen.txt`](requirements_qwen.txt) | new | 1, 3, 4 |
 | [`scripts/scripts_train/train_qwen_vla_navsim.sh`](scripts/scripts_train/train_qwen_vla_navsim.sh) | new | 1, 2 |
-| [`tools/synth/synth_qwen_vla_data.py`](tools/synth/synth_qwen_vla_data.py) | new | 2 |
+| [`tools/synth/synth_qwen_vla_data.py`](tools/synth/synth_qwen_vla_data.py) | new | 2, 10 |
 | [`reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/data_qwen_vla.py`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/data_qwen_vla.py) | modified | 4 |
 | [`reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/rope2d.py`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/dataset/rope2d.py) | modified | 4 |
 | [`reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py`](reference/Qwen2.5-VL/qwen-vl-finetune/qwenvl/train/trainer.py) | modified | 5 |
