@@ -62,13 +62,15 @@ Every code change that a run will use follows exactly one path:
 
 1. modify locally
 2. commit locally **only when the user says so** — never commit on your own
-3. push
+3. push **from this machine**
 4. pull on the box
-5. run
+5. run, and add the run directory + base commit to the Run index
 
-**Never copy files to the box** (`scp`, `rsync`, `tar | ssh`). A directly
-copied file leaves the box with an uncommitted working tree, so there is no
-record of what actually ran.
+**The box is pull-only.** Never `git push` from it. **Never copy files to the
+box** (`scp`, `rsync`, `tar | ssh`) either — every change must arrive through
+commit → push → pull so there is a record of what actually ran. If this
+machine cannot reach GitHub, stop and ask rather than routing around the
+push.
 
 ### Environment caveat
 
@@ -507,6 +509,98 @@ predicting zero noise) and does not move within 60 steps. This confirms the
 pipeline on non-degenerate inputs but is **not** a learning result; the earlier
 ~1e-3 losses were an artifact of the identity task. A few hundred steps are
 needed to tell whether the ROSS branch fits the real objective.
+
+**Corrected by Step 11:** the flat ~1.0 was not an insufficient-steps effect.
+`factor` was frozen at a huge garbage value, which swamped the UNet input and
+pinned the loss at the unconditional baseline. With the gate fixed, the first
+step already reports `ross_loss` ≈ 0.0019 (Step 11). The ~1e-3 losses on the
+degenerate data remain an artifact of the identity task, but the ~1.0 measured
+here was the gate bug.
+
+---
+
+## Step 11 — ROSS conditioning gates were initialized from garbage
+
+The two gates that scale the VLM conditioning into the SD1.5 UNet
+([`denoiser_sd.py:53,60`](reference/transformers/src/transformers/models/qwen2_5_vl/modeling_ross/denoiser_sd.py#L53))
+are bare `nn.Parameter`s created with `torch.tensor(0.)`. Values observed at
+load:
+
+| Run | `factor` | `factor_a` |
+|---|---|---|
+| 20-step (Step 7), saved | 6.6e29 | — |
+| 60-step corrected, saved | −4.97e−13 | −1.78e24 |
+| 100-step corrected, saved | −1.95e34 | 0.0069 |
+| 3-step diagnostic | 6.36e−33 | 6.36e−33 |
+| 3-step verification (after fix) | 3.9e−37 | **2.62e38** |
+
+The `[GATE]` prints in `setup_vla_model_and_tokenizer` show the value is
+already wrong immediately after `from_pretrained`, before DeepSpeed or the
+Trainer exist.
+
+Root cause:
+
+- `from_pretrained` builds the model under `init_empty_weights()`
+  ([`modeling_utils.py:4494`](reference/transformers/src/transformers/modeling_utils.py#L4494)),
+  so the `torch.tensor(0.)` initializer is discarded and the parameter is
+  created on the meta device.
+- Neither gate exists in the Qwen checkpoint, so both are missing keys.
+- `PreTrainedModel._init_weights` does not handle bare `nn.Parameter`s; its
+  docstring says a model adding one must override it
+  ([`modeling_utils.py:3028-3032`](reference/transformers/src/transformers/modeling_utils.py#L3028-L3032)).
+- The missing keys are therefore materialized from uninitialized memory.
+
+Consequences depended on the garbage value:
+
+- Large (1e16–1e38): `factor * z` swamps the UNet input; the first GroupNorm
+  normalizes the scale away, `ross_loss` sits at ~1.0, and the gradient with
+  respect to the gate vanishes. The gate stays at that value for the whole run
+  (confirmed: identical across all 100 steps of the Step 10 rerun).
+- Tiny (≈1e−33): conditioning is effectively off, and the gates *do* move.
+
+The conditioning tensors themselves were healthy throughout:
+`z_absmean ≈ 0.18`, `za_absmean ≈ 0.23`.
+
+Fix (`c024db1`): zero both gates explicitly after `from_pretrained`, restoring
+the intended zero-init.
+
+Verification — 3 steps after the fix (`logs/ross_gate_fixed_20261020`):
+
+| Stage / step | `factor` | `factor_a` | `cond_absmean` | `ross_loss` |
+|---|---|---|---|---|
+| after `from_pretrained` | 3.9e−37 | 2.6e+38 | — | — |
+| after zero-init | 0 | 0 | — | — |
+| step 1 | 0 | 0 | 0 | 0.0019 |
+| step 3 | −2.43e−06 | −6.89e−07 | 4.7e−07 | 0.0064 |
+
+Both gates now start at zero and begin moving, so the gating is trainable.
+
+The temporary `[GATE]` stage prints and the per-step `z_absmean` /
+`za_absmean` / `cond_absmean` logging are still in the tree; remove them once
+the fix is confirmed over a longer run.
+
+---
+
+## Run index
+
+Every run records the commit it is based on. "Code" is the commit whose tree
+the run actually executed; where a directly copied file was used, both the
+file's commit and the box `HEAD` are noted.
+
+| Run directory | Step | Code | Steps |
+|---|---|---|---|
+| `train_qwen_vla_20261019_091442` | 7 | `67292e7` | 20 |
+| `diag_ross_lr1e-4` | 8 | `67292e7` | 100 |
+| `ross_confirm_300` | 9 | `67292e7` | 70 / 300 (interrupted) |
+| `ross_short_20261020` | 10 | `e988fef` | 60 |
+| `ross_100_20261020` | 10 | `e988fef` | 100 |
+| `ross_100_gatelog_20261020` | 11 | `89edc4e` file on `c409ca4` HEAD (direct copy) | 100 (killed) |
+| `ross_gatelog2_20261020` | 11 | `89edc4e` file on `c409ca4` HEAD (direct copy) | 100 |
+| `ross_gate_diag_20261020` | 11 | `016a83f` | 3 |
+| `ross_gate_fixed_20261020` | 11 | `c024db1` file on `016a83f` HEAD (direct copy) | 3 |
+
+`train_qwen_vla_20261019_085720` and `_090116` are earlier failed attempts
+with no `trainer_state.json`.
 
 ---
 
