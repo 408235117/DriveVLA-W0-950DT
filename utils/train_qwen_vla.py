@@ -11,6 +11,7 @@ import logging
 import pathlib
 import pickle
 import random
+import time
 import numpy as np
 from pathlib import Path
 import torch
@@ -250,11 +251,19 @@ class RossTrainer(Trainer):
             self._hash_logfile.write(json.dumps(record) + '\n')
             self._hash_logfile.flush()  # survive crashes
 
+        t0 = time.perf_counter()
         loss = super().training_step(model, inputs, num_items_in_batch)
+        device_synchronize()  # count completed device work, not just enqueue time
+        step_s = time.perf_counter() - t0
 
         # 累积 forward 写入的 _last_logs
         logs = getattr(model, "_last_logs", None)
         if logs:
+            logs["step_time_s"] = step_s
+            logs["samples_per_s"] = (
+                float(self.args.per_device_train_batch_size * self.args.world_size)
+                / max(step_s, 1e-9)
+            )
             for k, v in logs.items():
                 try:
                     self._acc_sum[k] += float(v)
