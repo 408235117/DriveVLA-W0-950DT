@@ -56,3 +56,5 @@ class TrainingArguments(transformers.TrainingArguments):
     attn_type: Optional[str] = field(default="fa2", metadata={"help": "Attention implementation: fa2, sdpa, or eager. FA2 is CUDA-only; falls back to sdpa on NPU."})
     deterministic: bool = field(default=False, metadata={"help": "Enable strict reproducibility for NPU vs GPU cross-platform comparison"})
     log_data_hash: bool = field(default=False, metadata={"help": "Log SHA256 hash of each batch's data tensors for NPU vs GPU data-order verification"})
+    npu_profiling: bool = field(default=False, metadata={"help": "Wrap the train loop with torch_npu.profiler (NPU only)"})
+    npu_profiler_level: int = field(default=0, metadata={"help": "0=NPU only; 1=CPU+NPU, record_shapes, ProfilerLevel.Level1 (L1 collector)"})

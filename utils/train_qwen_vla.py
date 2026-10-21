@@ -171,6 +171,7 @@ from transformers import (
     Qwen2_5_VLConfig,
     AutoTokenizer,
     AutoProcessor,
+    TrainerCallback,
 
 )
 
@@ -289,7 +290,63 @@ class RossTrainer(Trainer):
             self._log_mean_and_reset()
 
         return loss
-    
+
+
+class NpuProfilerCallback(TrainerCallback):
+    """Wrap the HF Trainer loop with torch_npu.profiler (NPU only, opt-in).
+
+    Mirrors the emu3 branch implementation (utils/train_moe.py): start on
+    on_train_begin, one prof.step() per optimizer step, stop on_train_end.
+    The schedule skips the warm-up steps, then records one
+    wait/warmup/active window into a single fully-warmed trace.
+
+    level 0: NPU activity only (low overhead).
+    level 1: CPU+NPU activities, record_shapes=True,
+             profiler_level=ProfilerLevel.Level1 (the "L1" collector).
+    """
+
+    def __init__(self, trace_dir: str, level: int = 0):
+        self._trace_dir = trace_dir
+        self._level = level
+        self._prof = None
+
+    def _build(self):
+        import torch_npu
+
+        schedule = torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=26)
+        trace = torch_npu.profiler.tensorboard_trace_handler(self._trace_dir)
+        if self._level == 1:
+            return torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                with_stack=False,
+                record_shapes=True,
+                profile_memory=False,
+                schedule=schedule,
+                experimental_config=torch_npu.profiler._ExperimentalConfig(
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1
+                ),
+                on_trace_ready=trace,
+            )
+        return torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.NPU],
+            schedule=schedule,
+            on_trace_ready=trace,
+        )
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._prof = self._build()
+        self._prof.start()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._prof.step()
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._prof.stop()
+
+
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
@@ -540,7 +597,21 @@ def train():
         args=training_args,
         **data_module
     )
-    
+
+    # Optional NPU profiling (opt-in via --npu_profiling). Traces land under the
+    # run directory so they stay with the run.
+    if getattr(training_args, "npu_profiling", False):
+        if _device_type == "npu":
+            lvl = int(getattr(training_args, "npu_profiler_level", 0))
+            trace_dir = os.path.join(
+                training_args.output_dir,
+                "npu_profile" if lvl == 0 else f"npu_profile_level{lvl}",
+            )
+            trainer.add_callback(NpuProfilerCallback(trace_dir, lvl))
+            rank0_print(f"[NpuProfiler] level {lvl} active - traces -> {trace_dir}")
+        else:
+            rank0_print(f"[NpuProfiler] requires NPU (got {_device_type}); ignored")
+
     # Print dataloader len
     if torch.distributed.get_rank() == 0:
         rank0_print(f"dataloader len:")

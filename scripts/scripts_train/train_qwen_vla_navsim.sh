@@ -83,6 +83,8 @@ SEED=42
 SHUFFLE=true
 DETERMINISTIC=false
 LOG_DATA_HASH=false
+NPU_PROFILING=false
+NPU_PROFILER_LEVEL=0
 
 usage() {
   cat <<EOF
@@ -142,6 +144,10 @@ Misc:
   --shuffle <b>                (true)
   --deterministic              strict reproducibility (slow)
   --log_data_hash              log a SHA256 per batch to <run>/data_hashes/
+  --npu_profiling              wrap the train loop with torch_npu.profiler (NPU only;
+                               traces -> <run>/npu_profile[_level<N>])
+  --npu_profiler_level <n>     (0) 0=NPU only; 1=CPU+NPU + record_shapes +
+                               ProfilerLevel.Level1 (L1 collector)
   -h, --help                   this message
 EOF
 }
@@ -196,6 +202,8 @@ while [[ $# -gt 0 ]]; do
     --shuffle)               SHUFFLE="$2";                 shift 2 ;;
     --deterministic)         DETERMINISTIC=true;           shift ;;
     --log_data_hash)         LOG_DATA_HASH=true;           shift ;;
+    --npu_profiling)         NPU_PROFILING=true;           shift ;;
+    --npu_profiler_level)    NPU_PROFILER_LEVEL="$2";      shift 2 ;;
     --help|-h)               usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -306,6 +314,7 @@ esac
 
 DET_FLAG=""; [ "$DETERMINISTIC" = true ] && DET_FLAG="--deterministic"
 HASH_FLAG=""; [ "$LOG_DATA_HASH" = true ] && HASH_FLAG="--log_data_hash"
+PROF_FLAG=""; [ "$NPU_PROFILING" = true ] && PROF_FLAG="--npu_profiling --npu_profiler_level $NPU_PROFILER_LEVEL"
 
 RUN_DIR="$OUTPUT_DIR/$EXP_NAME"
 mkdir -p "$RUN_DIR"
@@ -332,6 +341,7 @@ echo "  max_steps / lr:        $MAX_STEPS / $LR"
 echo "  max_pixels:            $MAX_PIXELS  (target grid 10x18 = 180 tokens)"
 echo "  cur_frame_idx / fut:   $CUR_FRAME_IDX / $FUTURE_NUMS"
 echo "  deepspeed:             $DEEPSPEED_CONFIG (zero stage $ZERO_STAGE)"
+echo "  npu profiling:         $NPU_PROFILING (level $NPU_PROFILER_LEVEL)"
 echo ""
 
 # ============================================================
@@ -389,7 +399,7 @@ torchrun \
     --eval_strategy "$EVAL_STRATEGY" \
     --logging_steps "$LOGGING_STEPS" \
     --report_to "$REPORT_TO" \
-    $DET_FLAG $HASH_FLAG
+    $DET_FLAG $HASH_FLAG $PROF_FLAG
 
 echo ""
 echo "Training complete. Run dir: $RUN_DIR"
