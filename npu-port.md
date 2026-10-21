@@ -581,6 +581,52 @@ the fix is confirmed over a longer run.
 
 ---
 
+## Step 12 — Throughput baseline (batch-size sweep)
+
+Measured on 8 × Ascend 950DT with the current harness (ZeRO-3 CPU offload,
+sdpa, bf16, gradient checkpointing, `model_max_length=4096`, 504×280 images,
+synthetic 4,096-scene set). Code: `fbae548` (per-step timing instrumentation).
+
+Sizes 2–16 ran 50 steps; 32–68 ran 20 steps (ceiling scan). Metrics are
+per-step medians from the steady-state portion (first 5 steps dropped);
+`step_time_s` is measured around a device sync.
+
+| per-device bs | global batch | step median | samples/s median | samples/s max | peak HBM/device |
+|---|---|---|---|---|---|
+| 2 | 16 | 8.20 s | 1.96 | 2.02 | — |
+| 4 | 32 | 8.76 s | 3.67 | 3.96 | — |
+| 8 | 64 | 9.65 s | 6.64 | 7.20 | — |
+| 16 | 128 | 11.39 s | 11.29 | 11.87 | — |
+| 32 | 256 | 15.93 s | 16.14 | 16.60 | 96,550 MB (98.2%) |
+| 64 | 512 | 27.96 s | 18.42 | 19.87 | 98,214 MB (99.9%) |
+| 66 | 528 | 26.95 s | 19.75 | 20.66 | 93,471 MB (95.1%) |
+| **68** | **544** | **27.11 s** | **20.49** | **21.32** | **98,285 MB (100.0%)** |
+| 70 | 560 | OOM after 5 steps | — | — | 98,293 MB |
+| 128 | 1024 | OOM at allocation (30.7 GiB) | — | — | — |
+
+**Baseline:** the current harness peaks at **≈20.5 samples/s** (bs=68, global
+batch 544). Recommended operating point is **bs=66** (19.75 samples/s, ~5 %
+HBM headroom) or **bs=64** (18.42 samples/s) for longer runs.
+
+Notes:
+
+- `bs=1` is not testable — the ROSS forward squeezes away the batch dim.
+- Throughput flattens above bs=32: doubling the batch buys ~14 % (32→64) and
+  ~11 % (64→68). The step is dominated by fixed per-step cost (ZeRO-3 CPU
+  optimizer, VAE encode, SD1.5 UNet); activation memory limits the batch, not
+  parameter count.
+- `bs=70` completed 5 steps before OOM, so fitting at step 1 does not prove a
+  size is stable. HBM figures are 20 s maxima and under-report transients
+  (bs=64 read 99.9 % while bs=66 read 95.1 %), so treat everything above
+  bs=64 as sitting at the wall.
+- Each run writes an 18 GB final model; the harness has no skip-save flag.
+
+Run directories: `logs/bs_sweep50_20261020/`, `logs/bs_ceiling_20261020/`,
+`logs/bs_fine_20261020/`. `logs/bs_sweep_20261020/` is a killed 12-step
+attempt and should be ignored.
+
+---
+
 ## Run index
 
 Every run records the commit it is based on. "Code" is the commit whose tree
@@ -598,6 +644,9 @@ file's commit and the box `HEAD` are noted.
 | `ross_gatelog2_20261020` | 11 | `89edc4e` file on `c409ca4` HEAD (direct copy) | 100 |
 | `ross_gate_diag_20261020` | 11 | `016a83f` | 3 |
 | `ross_gate_fixed_20261020` | 11 | `c024db1` file on `016a83f` HEAD (direct copy) | 3 |
+| `bs_sweep50_20261020/bs{2,4,8,16}` | 12 | `fbae548` file on `016a83f` HEAD (direct copy) | 50 |
+| `bs_ceiling_20261020/bs{32,64,128}` | 12 | `fbae548` file on `016a83f` HEAD (direct copy) | 20 (128 OOM) |
+| `bs_fine_20261020/bs{66,68,70}` | 12 | `fbae548` file on `016a83f` HEAD (direct copy) | 20 (70 OOM at step 5) |
 
 `train_qwen_vla_20261019_085720` and `_090116` are earlier failed attempts
 with no `trainer_state.json`.
