@@ -28,7 +28,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 MODEL_NAME_OR_PATH="Qwen/Qwen2.5-VL-7B-Instruct"
 SD_MODEL_PATH=""
 ACTION_TOKENIZER_PATH="$ROOT/configs/fast"
-DEEPSPEED_CONFIG="$ROOT/scripts/sft/zero3_offload.json"
+DEEPSPEED_CONFIG="$ROOT/scripts/sft/zero2.json"
 DEEPSPEED_CONFIG_EXPLICIT=false
 
 DATA_PATH=""
@@ -39,9 +39,9 @@ EXP_NAME="navsim"
 
 NGPUS=8
 MASTER_PORT=23458
-BATCH_SIZE=2
+BATCH_SIZE=24
 GRAD_ACCUM=1
-NUM_WORKERS=12
+NUM_WORKERS=24
 FP="bf16"
 ATTN_TYPE="sdpa"
 DEVICE="auto"
@@ -55,7 +55,7 @@ LR="5e-5"
 WEIGHT_DECAY="0.1"
 MAX_GRAD_NORM="5.0"
 MODEL_MAX_LENGTH=4096
-ZERO_STAGE=3
+ZERO_STAGE=2
 EVAL_STRATEGY="no"
 REPORT_TO="tensorboard"
 
@@ -100,9 +100,9 @@ Model:
 
 Training:
   --ngpus <n>                  (8)
-  --batch_size <n>             per-device batch, must be >= 2 (default: 2)
+  --batch_size <n>             per-device batch, must be >= 2 (default: 24)
   --grad_accum <n>             (1)
-  --num_workers <n>            (12)
+  --num_workers <n>            (24)
   --fp <bf16|fp16|fp32>        (bf16)
   --attn_type <sdpa|fa2|eager> (sdpa; fa2 is CUDA-only and needs flash-attn)
   --device <auto|cuda|npu>     (auto)
@@ -115,7 +115,7 @@ Training:
   --weight_decay <f>           (0.1)
   --max_grad_norm <f>          (5.0)
   --model_max_length <n>       (4096)
-  --zero_stage <2|3>           (3; maps to scripts/sft/zero{2,3}_offload.json)
+  --zero_stage <2|3>           (2; maps to scripts/sft/zero{2,3}.json, no CPU offload)
   --deepspeed_config <json>    explicit DeepSpeed config (overrides --zero_stage)
   --eval_strategy <s>          (no; this dataset has no eval split)
   --report_to <s>              (tensorboard; also none, wandb)
@@ -224,8 +224,8 @@ SD_PARENT=$(dirname "$SD_UNET")
 # DeepSpeed config
 if [ "$DEEPSPEED_CONFIG_EXPLICIT" = false ]; then
   case "$ZERO_STAGE" in
-    2) DEEPSPEED_CONFIG="$ROOT/scripts/sft/zero2_offload.json" ;;
-    3) DEEPSPEED_CONFIG="$ROOT/scripts/sft/zero3_offload.json" ;;
+    2) DEEPSPEED_CONFIG="$ROOT/scripts/sft/zero2.json" ;;
+    3) DEEPSPEED_CONFIG="$ROOT/scripts/sft/zero3.json" ;;
     *) die "--zero_stage must be 2 or 3 (got '$ZERO_STAGE')" ;;
   esac
 fi

@@ -627,6 +627,50 @@ attempt and should be ignored.
 
 ---
 
+## Step 13 — Throughput optimization (50-step protocol)
+
+All runs: 8 × Ascend 950DT, **50 steps**, logged `train_samples_per_second`
+(HF Trainer's wall-clock average, which includes data loading), same data and
+recipe. Code: `fbae548` (per-step timing) and `c6f95aa` (ZeRO-2 config),
+direct-copied onto a `23e62ee` HEAD.
+
+| config | bs | workers | runtime | samples/s | vs baseline |
+|---|---|---|---|---|---|
+| ZeRO-3 + CPU offload | 68 | 12 | 1699.3 s | 16.006 | — |
+| ZeRO-3 no offload | 48 | 12 | 980.2 s | 19.588 | +22% |
+| ZeRO-3 no offload | 48 | 24 | 923.0 s | 20.803 | +30% |
+| ZeRO-2 no offload | 24 | 12 | 453.0 s | 21.193 | +32% |
+| ZeRO-2 no offload | 32 | 12 | 590.9 s | 21.663 | +35% |
+| **ZeRO-2 no offload** | **24** | **24** | **441.4 s** | **21.750** | **+36%** |
+| ZeRO-2 no offload | 32 | 24 | 601.5 s | 21.281 | +33% |
+
+Findings:
+
+- **Removing CPU offload is the dominant win.** The fixed per-step cost falls
+  from ~27 s at bs=68 (offload) to ~3.5 s at bs=8 (no offload). The batch
+  ceiling drops from 68 to 48 (ZeRO-3) / 32 (ZeRO-2) because parameters and
+  Adam state move into HBM, but throughput still rises.
+- **ZeRO-2 beats ZeRO-3.** Parameters are replicated, but there is no per-step
+  parameter all-gather. At equal batch ZeRO-2 is consistently faster.
+- **Gradient checkpointing is required.** Disabling it OOMs at bs=8 on step 2
+  (88.5 GB allocated, then a 46 MB allocation fails).
+- **More dataloader workers help, up to CPU saturation.** 8 ranks × 24 workers
+  = 192 cores exactly; at bs=32 that oversubscribes and regresses (21.66 →
+  21.28), while at bs=24 it improves (21.19 → 21.75).
+- The last three rows are within ~2 % run-to-run noise.
+- Remaining gap: `step_time_s` 7.36 s vs wall 8.83 s at the best config — ~1.5 s
+  per step is data loading, not compute.
+
+New defaults in
+[`scripts/scripts_train/train_qwen_vla_navsim.sh`](scripts/scripts_train/train_qwen_vla_navsim.sh):
+ZeRO-2 without offload (`scripts/sft/zero2.json`), per-device batch 24, 24
+dataloader workers. `--zero_stage 2|3` now maps to `scripts/sft/zero{2,3}.json`;
+the `*_offload.json` configs remain available via `--deepspeed_config`.
+
+The Step 12 numbers (ZeRO-3 + offload) are superseded by this table.
+
+---
+
 ## Run index
 
 Every run records the commit it is based on. "Code" is the commit whose tree
@@ -647,6 +691,12 @@ file's commit and the box `HEAD` are noted.
 | `bs_sweep50_20261020/bs{2,4,8,16}` | 12 | `fbae548` file on `016a83f` HEAD (direct copy) | 50 |
 | `bs_ceiling_20261020/bs{32,64,128}` | 12 | `fbae548` file on `016a83f` HEAD (direct copy) | 20 (128 OOM) |
 | `bs_fine_20261020/bs{66,68,70}` | 12 | `fbae548` file on `016a83f` HEAD (direct copy) | 20 (70 OOM at step 5) |
+| `bs_nooff3_20261021/bs{8,16,24,32,48}` | 13 | `fbae548` file on `23e62ee` HEAD (direct copy) | 20 |
+| `bs_zero2_20261021/bs{8,16,24,32}` | 13 | `c6f95aa` file on `23e62ee` HEAD (direct copy) | 20 |
+| `bs_nockpt_20261021/bs8` | 13 | `fbae548` file on `23e62ee` HEAD (direct copy) | OOM at step 2 |
+| `bs_base50_20261021/bs68` | 13 | `fbae548` file on `23e62ee` HEAD (direct copy) | 50 |
+| `bs_z3_50_20261021/bs48`, `bs_w24_50_20261021/bs48` | 13 | `fbae548` file on `23e62ee` HEAD (direct copy) | 50 |
+| `bs_z2_50_20261021/bs{24,32}`, `bs_z2_w24_50_20261021/bs{24,32}` | 13 | `c6f95aa` file on `23e62ee` HEAD (direct copy) | 50 |
 
 `train_qwen_vla_20261019_085720` and `_090116` are earlier failed attempts
 with no `trainer_state.json`.
