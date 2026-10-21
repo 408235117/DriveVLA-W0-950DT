@@ -39,11 +39,11 @@ EXP_NAME="navsim"
 
 NGPUS=8
 MASTER_PORT=23458
-BATCH_SIZE=24
+BATCH_SIZE=40
 GRAD_ACCUM=1
 NUM_WORKERS=24
 FP="bf16"
-ATTN_TYPE="sdpa"
+ATTN_TYPE="fa2"
 DEVICE="auto"
 OPTIM="adamw_torch"
 
@@ -101,11 +101,11 @@ Model:
 
 Training:
   --ngpus <n>                  (8)
-  --batch_size <n>             per-device batch, must be >= 2 (default: 24)
+  --batch_size <n>             per-device batch, must be >= 2 (default: 40)
   --grad_accum <n>             (1)
   --num_workers <n>            (24)
   --fp <bf16|fp16|fp32>        (bf16)
-  --attn_type <sdpa|fa2|eager> (sdpa; fa2 uses the vendored NPU flash-attention path)
+  --attn_type <sdpa|fa2|eager> (fa2; uses the vendored NPU flash-attention path)
   --device <auto|cuda|npu>     (auto)
   --optim <name>               HF optimizer name (adamw_torch; adamw_torch_fused
                                selects the NPU fused AdamW kernel)

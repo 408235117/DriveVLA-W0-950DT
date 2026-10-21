@@ -17,8 +17,8 @@ reason for it, and what is still outstanding.
 | SSH alias | `ott9-a57` |
 | Host / user | `liteserver-hps-d235-00007.novalocal` / `root` |
 | Repository | `/mnt/sfs_turbo/lmc/DriveVLA-W0` |
-| tmux session | `lmc` (also `lmc-2`, `lmc-compile`) |
-| Conda env | `drivevla` — active only inside the `lmc` session |
+| tmux session | `lmc-w0-3` (group `lmc-w0`) |
+| Conda env | `drivevla` — active only inside the `lmc-w0-3` session |
 | Accelerators | 8 × Ascend NPU (`/dev/davinci0..7`) |
 | Qwen weights | `/mnt/sfs_turbo/models/Qwen2.5-VL-7B-Instruct` |
 | SD1.5 weights | `/mnt/sfs_turbo/models/stable-diffusion-v1-5` |
@@ -28,14 +28,14 @@ reason for it, and what is still outstanding.
 
 ```bash
 ssh ott9-a57
-tmux attach -t lmc
+tmux attach -t lmc-w0-3
 ```
 
 ### Run a command without attaching
 
 ```bash
-ssh ott9-a57 "tmux send-keys -t lmc 'cd /mnt/sfs_turbo/lmc/DriveVLA-W0 && python -c \"import torch; print(torch.__version__)\"' C-m"
-ssh ott9-a57 "tmux capture-pane -t lmc -p | tail -20"
+ssh ott9-a57 "tmux send-keys -t lmc-w0-3 'cd /mnt/sfs_turbo/lmc/DriveVLA-W0 && python -c \"import torch; print(torch.__version__)\"' C-m"
+ssh ott9-a57 "tmux capture-pane -t lmc-w0-3 -p | tail -20"
 ```
 
 For automation, `ssh -o BatchMode=yes ott9-a57 '<command>'` works (key auth is
@@ -43,14 +43,14 @@ configured) and returns the command's stdout.
 
 ### Launching runs — always use `tmux`
 
-**Launch every training/eval run inside the `lmc` tmux session. Do not use
+**Launch every training/eval run inside the `lmc-w0-3` tmux session. Do not use
 detached processes (`docker exec -d`, `nohup ... &`, background SSH jobs)
 unless explicitly told otherwise.** The session runs inside the training
 container with the env already active, and it is what the user monitors.
 
 ```bash
-ssh ott9-a57 "tmux send-keys -t lmc 'cd /mnt/sfs_turbo/lmc/DriveVLA-W0 && bash run_100.sh 2>&1 | tee logs/run.log' C-m"
-ssh ott9-a57 "tmux capture-pane -t lmc -p | tail -20"
+ssh ott9-a57 "tmux send-keys -t lmc-w0-3 'cd /mnt/sfs_turbo/lmc/DriveVLA-W0 && bash run_100.sh 2>&1 | tee logs/run.log' C-m"
+ssh ott9-a57 "tmux capture-pane -t lmc-w0-3 -p | tail -20"
 ```
 
 To stop a job, kill its processes (`pkill -f train_qwen_vla.py`) — do not send
@@ -80,7 +80,7 @@ A plain non-interactive SSH shell is **not** the training environment:
 ssh ott9-a57 'which python'   -> /usr/bin/python   (3.11.6, no torch)
 ```
 
-The `drivevla` env is active only inside the `lmc` tmux session
+The `drivevla` env is active only inside the `lmc-w0-3` tmux session
 (`which python` → `/usr/local/python3.12.13/bin/python`,
 `CONDA_PREFIX=/root/miniconda3/envs/drivevla`). Run Python/torch work through
 tmux, or use the exact interpreter path from inside that session.
@@ -92,12 +92,12 @@ file inspection can be done directly over SSH.
 
 ```bash
 ssh ott9-a57 'ls /dev/davinci* | head; nproc'
-ssh ott9-a57 "tmux send-keys -t lmc 'python -c \"import torch, torch_npu; print(torch.__version__, torch.npu.is_available(), torch.npu.device_count())\"' C-m"
+ssh ott9-a57 "tmux send-keys -t lmc-w0-3 'python -c \"import torch, torch_npu; print(torch.__version__, torch.npu.is_available(), torch.npu.device_count())\"' C-m"
 ```
 
 Expected: eight devices and `(2.7.1+cpu, True, 8)`.
 
-**Do not send `C-c`** to the `lmc` pane unless you intend to kill the running
+**Do not send `C-c`** to the `lmc-w0-3` pane unless you intend to kill the running
 job — the session is shared.
 
 ---
@@ -173,7 +173,8 @@ Features of the new launcher:
   `CUDA_DEVICE_MAX_CONNECTIONS`, `PYTORCH_CUDA_ALLOC_CONF`.
 - `PYTHONPATH` includes the repo root (for `reference.*` imports) and
   `reference/Qwen2.5-VL/qwen-vl-finetune`.
-- Rejects `fa2` on NPU; `sdpa` is the default.
+- Supports `fa2` on NPU through the vendored flash-attention path; `sdpa` is
+  the default until the A/B is recorded.
 - Zero-stage shortcuts `--zero_stage 2|3` → `scripts/sft/zero{2,3}_offload.json`.
 - Writes the full invocation to `<run_dir>/startup_command.txt`.
 - Resume is automatic: `train_qwen_vla.py` detects `checkpoint-*` in the run dir.
@@ -666,8 +667,78 @@ New defaults in
 ZeRO-2 without offload (`scripts/sft/zero2.json`), per-device batch 24, 24
 dataloader workers. `--zero_stage 2|3` now maps to `scripts/sft/zero{2,3}.json`;
 the `*_offload.json` configs remain available via `--deepspeed_config`.
+Step 14 supersedes the batch and attention defaults (fa2, batch 40).
 
 The Step 12 numbers (ZeRO-3 + offload) are superseded by this table.
+
+---
+
+## Step 14 — Ascend fused ops and the FA2 baseline
+
+The reference packages (`reference-packages/MindSpeed-MM`,
+`reference-packages/DrivingSDK`) were reviewed for native Ascend replacements.
+Neither is adoptable as a dependency: MindSpeed-MM has no DeepSpeed path (FSDP2
+/ Megatron only) and its Qwen2.5-VL examples are absent from the checkout;
+DrivingSDK's kernels are BEV / point-cloud ops, and its Qwen2.5-VL acceleration
+is itself a set of manual `torch_npu` patches. The useful pieces are the thin
+`torch_npu` wrappers, so this pass calls them directly.
+
+**Metric.** `samples_per_s` = global batch ÷ `step_time_s`, where
+`step_time_s` is the device-synced compute step. It excludes data loading; in
+a long run (order 10^6 steps) that fixed contribution is negligible, so this
+is the throughput figure used below.
+
+**Result** — 50 steps each, ZeRO-2 without offload, bf16, gradient
+checkpointing, bs=24 unless noted; per-step median after dropping the first 5
+steps. Code: `9fed329`.
+
+| run | bs | samples/s | vs base |
+|---|---|---|---|
+| base | 24 | 26.58 | — |
+| `ROSS_NPU_RMSNORM` | 24 | 26.79 | +0.8% |
+| `ROSS_NPU_SWIGLU` | 24 | 25.72 | −3.2% |
+| `ROSS_NPU_ROPE` | 24 | 24.83 | −6.6% |
+| `adamw_torch_fused` | 24 | 25.61 | −3.6% |
+| base2 (A-B-A anchor) | 24 | 26.24 | — |
+| **fa2** | 24 | **45.88** | **+75%** |
+| **fa2** | 32 | **47.17** | **+80%** |
+| **fa2** | **40** | **48.05** | **+83%** |
+| fa2 | 48 | — | OOM at step 2 |
+| fa2 | 42 | — | OOM at step 42 |
+
+Base-vs-base drift on this metric is 1.3%, so the three negative leaf-op
+results are real but small and none clears the keep threshold; RMSNorm is
+noise. **FA2 is the win: +83% at bs=40.**
+
+**New baseline:** ZeRO-2 no offload, `--attn_type fa2`, per-device batch 40
+→ **48.22 samples/s** (per-step median over a 200-step run, 6.64 s/step, no
+OOM), versus 26.58 for the sdpa baseline. The same config measured 48.05 over
+50 steps. These are now the launcher defaults (`ATTN_TYPE=fa2`,
+`BATCH_SIZE=40`). The leaf-op flags (`ROSS_NPU_RMSNORM`, `ROSS_NPU_SWIGLU`,
+`ROSS_NPU_ROPE`) are left off; they did not pay for themselves.
+
+Implementation:
+
+- `models/qwen2_5_vl/npu_fused_ops.py` — device-gated `npu_rms_norm` /
+  `npu_swiglu` / `npu_rotary_mul` helpers, each behind an env flag and
+  returning `None` on CUDA/CPU so the original path runs.
+- `utils/train_qwen_vla.py` — `fa2` now maps to `flash_attention_2` and is
+  allowed on NPU through the vendored `integrations/npu_flash_attention.py`.
+- `integrations/npu_flash_attention.py` — mask cache keyed by sequence length.
+  **Hardware constraint:** on this CANN 9.1 / Ascend 950 build,
+  `npu_fusion_attention` with `sparse_mode=2/3` fails kernel tiling unless the
+  mask is **at least 2048×2048**, even for shorter sequences; the mask is
+  clamped up to 2048 and grows for longer inputs.
+- Launcher — `--optim` (e.g. `adamw_torch_fused`) and the `fa2` path.
+- `tools/ascend_parity/check_fused_ops.py` — forward/backward parity for every
+  op vs the torch reference; all pass at ≤3.3e-3 relative (bf16), including
+  FA2 vs SDPA at 2.6e-3.
+
+Commits: `5bd6f6b` (ops + FA2), `9fed329` (>=2048 mask).
+
+200-step stability check at fa2/bs=40 (`logs/fa2_stab_20261021`): **passed**,
+200/200 steps, no OOM, median **48.22 samples/s** (6.64 s/step). Larger
+batches are not stable: bs=42 OOMs at step 42, bs=48 at step 2.
 
 ---
 
@@ -697,6 +768,10 @@ file's commit and the box `HEAD` are noted.
 | `bs_base50_20261021/bs68` | 13 | `fbae548` file on `23e62ee` HEAD (direct copy) | 50 |
 | `bs_z3_50_20261021/bs48`, `bs_w24_50_20261021/bs48` | 13 | `fbae548` file on `23e62ee` HEAD (direct copy) | 50 |
 | `bs_z2_50_20261021/bs{24,32}`, `bs_z2_w24_50_20261021/bs{24,32}` | 13 | `c6f95aa` file on `23e62ee` HEAD (direct copy) | 50 |
+| `fused_ab_20261021/{base,rmsnorm,swiglu,rope,adamw,fa2}` | 14 | `9fed329` | 50 |
+| `fused_ab2_20261021/{base2,fa2_32,fa2_40,fa2_48}` | 14 | `9fed329` | 50 (48 OOM at step 2) |
+| `fa2_fine_20261021/fa2_42` | 14 | `9fed329` | OOM at step 42 |
+| `fa2_stab_20261021/fa2_40_200` | 14 | `9fed329` | 200 |
 
 `train_qwen_vla_20261019_085720` and `_090116` are earlier failed attempts
 with no `trainer_state.json`.
