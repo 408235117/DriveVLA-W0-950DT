@@ -29,6 +29,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import check_model_inputs
 from .configuration_qwen2 import Qwen2Config
+from ..qwen2_5_vl.npu_fused_ops import fused_rms_norm
 
 
 class Qwen2MLP(nn.Module):
@@ -194,6 +195,9 @@ class Qwen2RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fused = fused_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if fused is not None:
+            return fused
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

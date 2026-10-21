@@ -52,6 +52,17 @@ else:
 # Reproducibility helpers (mirrors train_moe.py — PRECISION_ALIGNMENT.md)
 # ---------------------------------------------------------------------------
 
+
+def _npu_fa2_available() -> bool:
+    """True when the vendored transformers NPU flash-attention path can run."""
+    if _device_type != "npu":
+        return False
+    try:
+        import torch_npu
+    except ImportError:
+        return False
+    return hasattr(torch_npu, "npu_fusion_attention")
+
 def device_synchronize():
     if _device_type == "npu":
         torch.npu.synchronize()
@@ -322,14 +333,14 @@ def setup_vla_model_and_tokenizer(model_args, training_args):
                 extract_action_hidden=True,
                 sd_model_path=model_args.sd_model_path,
             )
-    # Resolve attention implementation with device-aware fallback
-    # FA2 is CUDA-only; fall back to sdpa on NPU / other devices
+    # Resolve attention implementation. The vendored transformers ships an
+    # Ascend NPU flash-attention path (integrations/npu_flash_attention.py), so
+    # FA2 is usable on NPU even though the `flash-attn` package is CUDA-only.
     attn_type = getattr(training_args, "attn_type", "fa2")
-    if attn_type == "fa2" and _device_type != "cuda":
+    attn_impl = {"fa2": "flash_attention_2"}.get(attn_type, attn_type)
+    if attn_impl == "flash_attention_2" and not _npu_fa2_available():
         attn_impl = "sdpa"
-        print(f"[Device] FA2 not available on {_device_type}, falling back to sdpa")
-    else:
-        attn_impl = attn_type
+        print(f"[Device] FA2 unavailable on {_device_type}, falling back to sdpa")
 
     model = model_class.from_pretrained(
             model_args.model_name_or_path,

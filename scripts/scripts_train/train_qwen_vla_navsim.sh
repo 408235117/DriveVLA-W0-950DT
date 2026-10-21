@@ -45,6 +45,7 @@ NUM_WORKERS=24
 FP="bf16"
 ATTN_TYPE="sdpa"
 DEVICE="auto"
+OPTIM="adamw_torch"
 
 MAX_STEPS=4000
 SAVE_STEPS=2000
@@ -104,8 +105,10 @@ Training:
   --grad_accum <n>             (1)
   --num_workers <n>            (24)
   --fp <bf16|fp16|fp32>        (bf16)
-  --attn_type <sdpa|fa2|eager> (sdpa; fa2 is CUDA-only and needs flash-attn)
+  --attn_type <sdpa|fa2|eager> (sdpa; fa2 uses the vendored NPU flash-attention path)
   --device <auto|cuda|npu>     (auto)
+  --optim <name>               HF optimizer name (adamw_torch; adamw_torch_fused
+                               selects the NPU fused AdamW kernel)
   --max_steps <n>              (4000)
   --save_steps <n>             (2000)
   --save_total_limit <n>       (2)
@@ -165,6 +168,7 @@ while [[ $# -gt 0 ]]; do
     --num_workers)           NUM_WORKERS="$2";             shift 2 ;;
     --fp)                    FP="$2";                      shift 2 ;;
     --attn_type)             ATTN_TYPE="$2";               shift 2 ;;
+    --optim)                 OPTIM="$2";                   shift 2 ;;
     --device)                DEVICE="$2";                  shift 2 ;;
     --max_steps)             MAX_STEPS="$2";               shift 2 ;;
     --save_steps)            SAVE_STEPS="$2";              shift 2 ;;
@@ -250,10 +254,6 @@ case "$DEVICE" in
   auto|cuda|npu) ;;
   *) die "--device must be auto, cuda, or npu (got '$DEVICE')" ;;
 esac
-
-if [ "$DEVICE" = "npu" ] && [ "$ATTN_TYPE" = "fa2" ]; then
-  die "--attn_type fa2 is CUDA-only; use sdpa"
-fi
 
 if [ "$DEVICE" = "npu" ]; then
   export INF_NAN_MODE_ENABLE=1
@@ -366,6 +366,7 @@ torchrun \
     $FP_FLAGS \
     --tf32 False \
     --attn_type "$ATTN_TYPE" \
+    --optim "$OPTIM" \
     --learning_rate "$LR" \
     --weight_decay "$WEIGHT_DECAY" \
     --lr_scheduler_type cosine_with_min_lr \

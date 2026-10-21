@@ -45,6 +45,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_to
 from ...utils.deprecation import deprecate_kwarg
 from ..qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLTextConfig, Qwen2_5_VLVisionConfig
+from .npu_fused_ops import fused_rotary_mul, fused_swiglu
 
 
 logger = logging.get_logger(__name__)
@@ -61,7 +62,12 @@ class Qwen2_5_VLMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_state):
-        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+        gate = self.gate_proj(hidden_state)
+        up = self.up_proj(hidden_state)
+        fused = fused_swiglu(gate, up)
+        if fused is not None:
+            return self.down_proj(fused)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class Qwen2_5_VisionPatchEmbed(nn.Module):
@@ -132,8 +138,13 @@ def apply_rotary_pos_emb_vision(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
+    cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    fused_q = fused_rotary_mul(q, cos.to(q.dtype), sin.to(q.dtype))
+    if fused_q is not None:
+        fused_k = fused_rotary_mul(k, cos.to(k.dtype), sin.to(k.dtype))
+        return fused_q.to(orig_q_dtype), fused_k.to(orig_k_dtype)
     q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    cos, sin = cos.float(), sin.float()
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     q_embed = q_embed.to(orig_q_dtype)
@@ -550,8 +561,12 @@ class Qwen2MLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        fused = fused_swiglu(gate, up)
+        if fused is not None:
+            return self.down_proj(fused)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
@@ -594,8 +609,12 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
         unsqueeze_dim
     )
 
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = fused_rotary_mul(q, cos.to(q.dtype), sin.to(q.dtype))
+    if q_embed is None:
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = fused_rotary_mul(k, cos.to(k.dtype), sin.to(k.dtype))
+    if k_embed is None:
+        k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 

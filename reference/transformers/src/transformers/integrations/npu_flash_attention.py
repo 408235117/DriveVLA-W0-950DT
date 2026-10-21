@@ -37,11 +37,17 @@ if SPARSE_MODE not in [TOP_LEFT_ALIGNED_CAUSAL_MASK_MODE, DOWN_RIGHT_ALIGNED_CAU
 ATTN_MASK_NPU_CACHE = {}
 
 
-def get_attn_mask_npu(device):
-    """Get or create attention mask for the specified device."""
-    if device not in ATTN_MASK_NPU_CACHE:
-        ATTN_MASK_NPU_CACHE[device] = torch.triu(torch.ones([2048, 2048], device=device), diagonal=1).bool()
-    return ATTN_MASK_NPU_CACHE[device]
+def get_attn_mask_npu(device, seq_len=2048):
+    """Get or create a causal mask for ``(device, seq_len)``.
+
+    The mask must cover the actual sequence length: a fixed 2048x2048 mask is
+    wrong for batches longer than 2048 (the launcher allows
+    ``model_max_length=4096``).
+    """
+    key = (device, seq_len)
+    if key not in ATTN_MASK_NPU_CACHE:
+        ATTN_MASK_NPU_CACHE[key] = torch.triu(torch.ones([seq_len, seq_len], device=device), diagonal=1).bool()
+    return ATTN_MASK_NPU_CACHE[key]
 
 
 def is_npu_fa2_top_left_aligned_causal_mask():
@@ -66,7 +72,7 @@ def npu_flash_attn_func(
         head_num = q.shape[2]
         output = npu_fusion_attention(q, k, v, head_num, "BSND", keep_prob=keep_prob, scale=softmax_scale)[0]
     else:
-        attn_mask_npu = get_attn_mask_npu(q.device)
+        attn_mask_npu = get_attn_mask_npu(q.device, max(q.shape[1], k.shape[1]))
         head_num = q.shape[2]
         output = npu_fusion_attention(
             q,
@@ -117,7 +123,9 @@ def npu_flash_attn_varlen_func(
             actual_seq_kvlen=tuple(cu_seqlens_k[1:].cpu().numpy().tolist()),
         )[0]
     else:
-        attn_mask_npu = get_attn_mask_npu(q.device)
+        q_len = max_seqlen_q if max_seqlen_q is not None else int(cu_seqlens_q[-1])
+        k_len = max_seqlen_k if max_seqlen_k is not None else int(cu_seqlens_k[-1])
+        attn_mask_npu = get_attn_mask_npu(q.device, max(q_len, k_len))
         head_num = q.shape[1]
         output = npu_fusion_attention(
             q,
