@@ -104,22 +104,28 @@ def main():
     check("gelu exact bf16", outg, refg, TOL_BF16)
 
     # --- FA2 vs SDPA (causal, GQA 28/4, BSND) ---
+    # NOTE: this CANN/Ascend 950 build requires a mask of at least 2048x2048
+    # for sparse_mode 2/3; a seq-sized mask fails kernel tiling.
     Bq, Sq, Hq, Hkv, Dq = 2, 512, 28, 4, 128
-    qa = torch.randn(Bq, Sq, Hq, Dq, device=dev, dtype=torch.bfloat16)
-    ka = torch.randn(Bq, Sq, Hkv, Dq, device=dev, dtype=torch.bfloat16)
-    va = torch.randn(Bq, Sq, Hkv, Dq, device=dev, dtype=torch.bfloat16)
-    mask = torch.triu(torch.ones(Sq, Sq, device=dev, dtype=torch.bool), diagonal=1)
-    fa = torch_npu.npu_fusion_attention(
-        qa, ka, va, Hq, "BSND", keep_prob=1.0, scale=Dq ** -0.5,
-        atten_mask=mask, sparse_mode=3,
-    )[0]
-    rep = Hq // Hkv
-    k_r = ka.transpose(1, 2).repeat_interleave(rep, dim=1)
-    v_r = va.transpose(1, 2).repeat_interleave(rep, dim=1)
-    sdpa = F.scaled_dot_product_attention(
-        qa.transpose(1, 2).float(), k_r.float(), v_r.float(), is_causal=True
-    ).transpose(1, 2)
-    check("fa2 causal vs sdpa bf16", fa, sdpa, TOL_BF16)
+    try:
+        qa = torch.randn(Bq, Sq, Hq, Dq, device=dev, dtype=torch.bfloat16)
+        ka = torch.randn(Bq, Sq, Hkv, Dq, device=dev, dtype=torch.bfloat16)
+        va = torch.randn(Bq, Sq, Hkv, Dq, device=dev, dtype=torch.bfloat16)
+        mask = torch.triu(torch.ones(2048, 2048, device=dev, dtype=torch.bool), diagonal=1)
+        fa = torch_npu.npu_fusion_attention(
+            qa, ka, va, Hq, "BSND", keep_prob=1.0, scale=Dq ** -0.5,
+            atten_mask=mask, sparse_mode=3,
+        )[0]
+        rep = Hq // Hkv
+        k_r = ka.transpose(1, 2).repeat_interleave(rep, dim=1)
+        v_r = va.transpose(1, 2).repeat_interleave(rep, dim=1)
+        sdpa = F.scaled_dot_product_attention(
+            qa.transpose(1, 2).float(), k_r.float(), v_r.float(), is_causal=True
+        ).transpose(1, 2)
+        check("fa2 causal vs sdpa bf16", fa, sdpa, TOL_BF16)
+    except Exception as e:
+        print("FAIL fa2 causal vs sdpa:", type(e).__name__, str(e).splitlines()[0][:160])
+        failures.append("fa2")
 
     print()
     if failures:

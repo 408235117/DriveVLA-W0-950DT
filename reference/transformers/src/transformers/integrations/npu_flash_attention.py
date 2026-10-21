@@ -40,10 +40,12 @@ ATTN_MASK_NPU_CACHE = {}
 def get_attn_mask_npu(device, seq_len=2048):
     """Get or create a causal mask for ``(device, seq_len)``.
 
-    The mask must cover the actual sequence length: a fixed 2048x2048 mask is
-    wrong for batches longer than 2048 (the launcher allows
-    ``model_max_length=4096``).
+    Must cover the actual sequence length (``model_max_length`` allows 4096),
+    but on this CANN/Ascend 950 build the sparse_mode 2/3 tiling requires a
+    mask of **at least** 2048x2048 — smaller masks fail kernel tiling. Larger
+    masks are accepted for longer sequences.
     """
+    seq_len = max(int(seq_len), 2048)
     key = (device, seq_len)
     if key not in ATTN_MASK_NPU_CACHE:
         ATTN_MASK_NPU_CACHE[key] = torch.triu(torch.ones([seq_len, seq_len], device=device), diagonal=1).bool()
