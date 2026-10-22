@@ -192,11 +192,21 @@ from transformers.utils import (
 )
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_emu3 import Emu3Config
+import torch_npu
 
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+
+# NPU Flash Attention: override flash_attn_func with npu_fusion_attention on NPU
+try:
+    from .npu_flash_attention import npu_flash_attn_func, npu_flash_attn_varlen_func
+    flash_attn_func = npu_flash_attn_func
+    flash_attn_varlen_func = npu_flash_attn_varlen_func
+    print("[NPU] Using npu_fusion_attention for flash_attn_func")
+except ImportError:
+    pass
 
 import sys
 from models.policy_head.noise_schedulers import FlowMatchingScheduler
