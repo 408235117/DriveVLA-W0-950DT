@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import pathlib
 import transformers as tf
-from datasets import Emu3SFTDataset
+from drivevla_datasets import Emu3SFTDataset
 import sys
 import hashlib
 import json
@@ -80,9 +80,9 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(os.path.join(parent_dir, "reference", "Emu3"))
 from emu3.mllm import Emu3Config, Emu3Tokenizer, Emu3ForCausalLM, Emu3MoE, Emu3MoEConfig
 from transformers import AutoModel, Trainer, TrainerCallback
-from datasets import Emu3DrivingDataset
-from datasets import Emu3DrivingVAVADataset
-from datasets import Emu3DrivingNuplan6VADataset
+from drivevla_datasets import Emu3DrivingDataset
+from drivevla_datasets import Emu3DrivingVAVADataset
+from drivevla_datasets import Emu3DrivingNuplan6VADataset
 from torch.utils.data import WeightedRandomSampler, DataLoader, RandomSampler, SequentialSampler
 from transformers.trainer_utils import has_length
 
@@ -211,7 +211,7 @@ class NpuProfilerCallback(TrainerCallback):
                 with_stack=False,
                 record_shapes=True,
                 profile_memory=False,
-                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=26),
+                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=16),
                 experimental_config=torch_npu.profiler._ExperimentalConfig(
                     profiler_level=torch_npu.profiler.ProfilerLevel.Level1
                 ),
@@ -219,7 +219,7 @@ class NpuProfilerCallback(TrainerCallback):
             )
         return torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU],
-            schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=26),
+            schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=16),
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(self._trace_dir),
         )
 
@@ -233,6 +233,17 @@ class NpuProfilerCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         self._prof.stop()
 
+
+
+# TensorIndex optimization for NPU (optional, via env flag)
+if os.getenv("EMU3_NPU_TENSOR_INDEX") == "1" and _device_type == "npu":
+    try:
+        import torch_npu
+        # npu_fast_gather can accelerate index_select operations
+        torch_npu.npu.config.allow_internal_format = True
+        print("[NPU] TensorIndex optimization enabled (allow_internal_format)")
+    except Exception as e:
+        print(f"[NPU] TensorIndex optimization failed: {e}")
 
 class MemoryEfficientTrainer(tf.Trainer):
     """最简单的显存回收Trainer"""
@@ -427,6 +438,22 @@ class LoggingTrainer(tf.Trainer):
         for k in self._VAVA_EXTRA_KEYS:
             inputs.pop(k, None)
         return inputs
+
+    def create_optimizer(self):
+        opt = super().create_optimizer()
+        if os.getenv("EMU3_NPU_FUSED_ADAMW") == "1" and _device_type == "npu":
+            from torch_npu.optim import NpuFusedAdamW
+            fused_opt = NpuFusedAdamW(
+                self.model.parameters(),
+                lr=self.args.learning_rate,
+                betas=(self.args.adam_beta1, self.args.adam_beta2),
+                eps=self.args.adam_epsilon,
+                weight_decay=self.args.weight_decay,
+            )
+            print(f"[NPU] Optimizer replaced: {type(opt).__name__} -> NpuFusedAdamW")
+            return fused_opt
+        print(f"[NPU] Optimizer: {type(opt).__name__} (NpuFusedAdamW disabled)")
+        return opt
 
     def training_step(self, model: torch.nn.Module, inputs: dict) -> torch.Tensor:
         # Data hash logging -- compute BEFORE forward (the model can mutate inputs)

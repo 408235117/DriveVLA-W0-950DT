@@ -193,6 +193,11 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_emu3 import Emu3Config
 import torch_npu
+from .npu_fused_ops import fused_rms_norm, fused_swiglu, fused_rotary_mul, _print_status as _npu_fused_print
+try:
+    _npu_fused_print()
+except Exception:
+    pass
 
 
 if is_flash_attn_2_available():
@@ -265,6 +270,9 @@ class Emu3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        fused = fused_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if fused is not None:
+            return fused
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -386,8 +394,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = fused_rotary_mul(q, cos.to(q.dtype), sin.to(q.dtype))
+    if q_embed is None:
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = fused_rotary_mul(k, cos.to(k.dtype), sin.to(k.dtype))
+    if k_embed is None:
+        k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 
@@ -420,7 +432,13 @@ class Emu3MLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            fused = fused_swiglu(gate, up)
+            if fused is not None:
+                down_proj = self.down_proj(fused)
+            else:
+                down_proj = self.down_proj(self.act_fn(gate) * up)
 
         return down_proj
 
