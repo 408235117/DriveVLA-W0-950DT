@@ -67,3 +67,24 @@ def _print_status():
         enabled.append("rope")
     if enabled:
         print(f"[NPU] Fused ops enabled: {', '.join(enabled)}")
+
+def fused_add_rms_norm(x, residual, weight, eps):
+    """Fused residual Add + RMSNorm using npu_add_rms_norm_v2_functional
+
+    Replaces: residual + x, then RMSNorm(residual + x)
+    With: single npu_add_rms_norm_v2_functional kernel
+
+    Returns: (normed_output, residual_out) or None if not enabled
+    """
+    if os.getenv("EMU3_NPU_ADD_RMSNORM") != "1":
+        return None
+    try:
+        import torch_npu
+        # v2_functional returns (rstd, output, x_back)
+        # output = RMSNorm(residual + x)
+        rstd, output, x_back = torch_npu.npu_add_rms_norm_v2_functional(x, residual, weight, eps)
+        return output, x_back
+    except Exception as e:
+        print(f"[NPU] fused_add_rms_norm failed: {e}")
+        return None
+

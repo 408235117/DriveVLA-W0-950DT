@@ -193,7 +193,7 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_emu3 import Emu3Config
 import torch_npu
-from .npu_fused_ops import fused_rms_norm, fused_swiglu, fused_rotary_mul, _print_status as _npu_fused_print
+from .npu_fused_ops import fused_rms_norm, fused_swiglu, fused_rotary_mul, fused_add_rms_norm, _print_status as _npu_fused_print
 try:
     _npu_fused_print()
 except Exception:
@@ -1019,13 +1019,19 @@ class Emu3DecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + self.dropout(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        # Fused residual Add + post-attention RMSNorm
+        fused = fused_add_rms_norm(hidden_states, residual, self.post_attention_layernorm.weight, self.post_attention_layernorm.variance_epsilon)
+        if fused is not None:
+            hidden_states, residual = fused
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
         if _timing:
             self._submodule_times['self_attn'] = self._submodule_times.get('self_attn', 0.0) + _timing_event_end(_ev_attn)
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
         if _timing:
             _ev_mlp = _timing_event_start()
         hidden_states = self.mlp(hidden_states)
