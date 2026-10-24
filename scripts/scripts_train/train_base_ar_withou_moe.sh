@@ -180,7 +180,7 @@ export HCCL_DETERMINISTIC=TRUE
 # flash-attn isn't installed.)
 if [ "$ATTN_TYPE" = "auto" ]; then
   case "$DEVICE" in
-    npu)  ATTN_TYPE="sdpa" ;;
+    npu)  ATTN_TYPE="npu_fusion" ;;
     cuda) ATTN_TYPE="fa2" ;;
     *)    ATTN_TYPE="auto" ;;  # auto device — Python resolves against the real device
   esac
@@ -192,16 +192,16 @@ fi
 if [ "$DEVICE" = "npu" ]; then
   # NPU precision alignment
   export INF_NAN_MODE_ENABLE=1            # IEEE 754 (overflow → Inf/NaN)
-  export CLOSE_MATMUL_K_SHIFT=1           # deterministic MatMul
-  export ATB_MATMUL_SHUFFLE_K_ENABLE=0    # disable shuffle optimization
-  export ACL_OP_DETERMINISTIC=1           # deterministic ACL ops
+  #export CLOSE_MATMUL_K_SHIFT=1           # deterministic MatMul
+  export ATB_MATMUL_SHUFFLE_K_ENABLE=1    # enable shuffle optimization
+  #export ACL_OP_DETERMINISTIC=1           # deterministic ACL ops
 
   # Synchronous execution (traceable error stacks)
-  export ASCEND_LAUNCH_BLOCKING=1
-  export TASK_QUEUE_ENABLE=0              # disable task queue optimization
+  #export ASCEND_LAUNCH_BLOCKING=1
+  export TASK_QUEUE_ENABLE=2              # enable task queue optimization
 
   # Disable private storage format
-  export FLAGS_npu_storage_format=0
+  #export FLAGS_npu_storage_format=0
 
   # Ascend EP / CANN tuning (optional)
   : "${ASCEND_RT_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"

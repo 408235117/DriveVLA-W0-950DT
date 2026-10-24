@@ -136,6 +136,7 @@ def _install_grad_clip_hook():
     _CLIP_PATCHED = True
 
 
+from monitor import build_monitor
 class _RawGradNormCallback(TrainerCallback):
     """Report the raw pre-clip global grad norm when --max_grad_norm is disabled.
 
@@ -264,6 +265,9 @@ class MemoryEfficientTrainer(tf.Trainer):
 class LoggingTrainer(tf.Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._hbm, self._flops = build_monitor()
+        if self._flops.enabled and hasattr(self, 'model') and self.model is not None:
+            self._flops.attach(self.model)
 
         # Wall-clock timestamp of the last log() call, for per-step time tracking
         self._last_log_time = None
@@ -330,6 +334,16 @@ class LoggingTrainer(tf.Trainer):
             if self._tokens_since_last_log > 0 and logs["time_elapsed"] > 0:
                 ws = getattr(self.args, "world_size", 1)
                 logs["tokens_per_sec"] = round(self._tokens_since_last_log * ws / logs["time_elapsed"], 1)
+                # MFU and HBM output
+                if hasattr(self, '_flops') and self._flops.enabled and hasattr(self, '_last_flops'):
+                    step_time = logs.get("time_elapsed", 0)
+                    if step_time > 0:
+                        achieved, mfu = self._flops.compute_mfu(step_time)
+                        logs["achieved_tflops"] = round(achieved, 1)
+                        logs["mfu_pct"] = round(mfu, 1)
+                if hasattr(self, '_hbm') and self._hbm.enabled and self._hbm._records:
+                    snap = self._hbm._records[-1]
+                    logs["hbm_peak_gb"] = snap["max_allocated_gb"]
         self._last_log_time = now
         self._tokens_since_last_log = 0
         # Older installed transformers: Trainer.log(logs) only; 4.56+ also accepts start_time
@@ -468,7 +482,6 @@ class LoggingTrainer(tf.Trainer):
         indices = inputs.pop("index", None)
         # Pop VAVA-only keys that the model forward doesn't accept
         self._strip_non_model_keys(inputs)
-
         # Count non-padding tokens in this batch for TPS logging.
         # Use input_ids.numel() rather than attention_mask.sum() because TPS
         # is a compute-cost metric: padding tokens still consume FLOPs and
@@ -477,7 +490,14 @@ class LoggingTrainer(tf.Trainer):
         if ids is not None:
             self._tokens_since_last_log += int(ids.numel())
 
+        # HBM: reset peak before this step, then snapshot
+        if hasattr(self, '_hbm') and self._hbm.enabled:
+            self._hbm.reset_peak()
+            self._hbm.snapshot(f"step{self.state.global_step}_start")
         loss = super().training_step(model, inputs)
+        # HBM snapshot after compute
+        if hasattr(self, '_hbm') and self._hbm.enabled:
+            self._hbm.snapshot(f"step{self.state.global_step}_end")
 
         # ponytail: flush device stream so DeepSpeed get_global_grad_norm()
         # returns the actual gradient (not 0.0) on all platforms. Without this,
@@ -514,7 +534,13 @@ class LoggingTrainer(tf.Trainer):
         when the dataset adds VAVA / AR auxiliary keys.
         """
         self._strip_non_model_keys(inputs)
-        return super().compute_loss(model, inputs, return_outputs=return_outputs)
+        # FLOPs: reset before forward, read after forward (before backward)
+        if hasattr(self, '_flops') and self._flops.enabled:
+            self._flops.reset()
+        loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        if hasattr(self, '_flops') and self._flops.enabled:
+            self._last_flops = self._flops.model_training_flops
+        return loss
 
     def __del__(self):
         # Gracefully shut down the logging thread
@@ -664,10 +690,13 @@ def load_model(model_args, model_config, training_args):
         _ds_env = os.environ.pop("DS_CONFIG", None)
         _cf_env = os.environ.pop("CONFIG_FILE", None)
         try:
+            _load_attn_impl = attn_impl
+            if attn_impl == "npu_fusion":
+                _load_attn_impl = "sdpa"  # load with sdpa, swap after
             model = Emu3MoE.from_pretrained(
                 model_args.model_name_or_path,
                 config=model_config,
-                attn_implementation=attn_impl,
+                attn_implementation=_load_attn_impl,
                 torch_dtype=torch.bfloat16 if training_args.bf16 else None,
             )
         finally:
@@ -675,6 +704,37 @@ def load_model(model_args, model_config, training_args):
                 os.environ["DS_CONFIG"] = _ds_env
             if _cf_env is not None:
                 os.environ["CONFIG_FILE"] = _cf_env
+
+    # NPU: monkey-patch self_attn.forward with npu_flash_attn_func
+    if _device_type == "npu" and attn_impl == "npu_fusion":
+        from emu3.mllm.npu_flash_attention import npu_flash_attn_func
+        from emu3.mllm.modeling_emu3 import apply_rotary_pos_emb
+
+        def _npu_fusion_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
+            bsz, q_len, _ = hidden_states.size()
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            kv_seq_len = key_states.shape[-2]
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos.to(query_states.dtype), sin.to(key_states.dtype), position_ids)
+            # Convert BNSD to BSND for npu_flash_attn_func (native GQA: no repeat_kv needed)
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            scale = 1.0 / (self.head_dim ** 0.5)
+            attn_output = npu_flash_attn_func(
+                query_states, key_states, value_states,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                softmax_scale=scale, causal=True)
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None, past_key_value
+
+        import types
+        for layer in model.model.layers:
+            layer.self_attn.forward = types.MethodType(_npu_fusion_forward, layer.self_attn)
+        print("[NPU] Monkey-patched to npu_fusion attention (via npu_flash_attn_func)")
 
     # Training best-practices:
     #   1. Disable KV cache — wasteful during training (no generation),

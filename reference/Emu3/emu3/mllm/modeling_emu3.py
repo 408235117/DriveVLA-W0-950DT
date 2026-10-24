@@ -923,10 +923,34 @@ class Emu3SdpaAttention(Emu3Attention):
         return attn_output, None, past_key_value
 
 
+class Emu3NpuFusionAttention(Emu3Attention):
+    """NPU-native FlashAttention via npu_flash_attn_func (npu_fusion_attention with causal mask + GQA + dtype fix)"""
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
+        bsz, q_len, _ = hidden_states.size()
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        q = q.view(bsz, q_len, self.num_heads, self.head_dim)
+        k = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        kv_len = k.shape[1]
+        cos, sin = self.rotary_emb(v, seq_len=kv_len)
+        q, k = apply_rotary_pos_emb(q, k, cos.to(q.dtype), sin.to(k.dtype), position_ids)
+        scale = 1.0 / (self.head_dim ** 0.5)
+        attn_output = npu_flash_attn_func(
+            q, k, v,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            softmax_scale=scale, causal=True)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None, past_key_value
+
+
 EMU3_ATTENTION_CLASSES = {
     "eager": Emu3Attention,
     "flash_attention_2": Emu3FlashAttention2,
     "sdpa": Emu3SdpaAttention,
+    "npu_fusion": Emu3NpuFusionAttention,
 }
 
 
