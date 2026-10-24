@@ -71,6 +71,19 @@ CONSTANT_LR=false
 NPU_PROFILING=false
 NO_SAVE_WEIGHTS=false
 NPU_PROFILER_LEVEL=0
+
+# NPU融合算子开关: rms_norm/swiglu/rope/add_rms_norm, 减少kernel launch开销
+export EMU3_NPU_RMSNORM=1
+export EMU3_NPU_SWIGLU=1
+export EMU3_NPU_ROPE=1
+export EMU3_NPU_ADD_RMSNORM=1
+
+# Selective CE: 对lm_head chunked CE用reentrant checkpoint包裹, backward时重算exp()而非保存
+# 消除14.4GB exp中间tensor, 32层GC保持use_reentrant=false(支持torch.compile)
+# 问题场景: chunked_lm_head_cross_entropy的23个chunk产生(40928,8192)的exp中间tensor共14.4GB
+# 开启后HBM从68GB降至58.8GB, TPS从22356提升至43800
+export GC_SELECTIVE_CE=1
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --model_name_or_path)     MODEL_NAME_OR_PATH="$2";       shift 2 ;;

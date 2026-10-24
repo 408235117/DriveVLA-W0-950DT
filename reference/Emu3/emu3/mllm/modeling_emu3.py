@@ -86,6 +86,60 @@ def _timing_event_end(handle) -> float:
     return start.elapsed_time(end) / 1000.0  # ms → s
 
 
+# ===== Selective Checkpoint CE: recompute exp, save F.linear =====
+import os as _os_ce
+_GC_SELECTIVE_CE = _os_ce.environ.get('GC_SELECTIVE_CE', '0') == '1'
+if _GC_SELECTIVE_CE:
+    import functools as _ft_ce
+    from torch.utils.checkpoint import CheckpointPolicy as _CP, create_selective_checkpoint_contexts as _cscc
+    def _ce_policy(ctx, op, *a, **kw):
+        if op == torch.ops.aten.mm.default or op == torch.ops.aten.addmm.default: return _CP.MUST_SAVE
+        if op == torch.ops.aten.exp.default: return _CP.MUST_RECOMPUTE
+        if op == torch.ops.aten.sub.Tensor: return _CP.MUST_RECOMPUTE
+        if op == torch.ops.aten.max.dim: return _CP.MUST_RECOMPUTE
+        return _CP.MUST_SAVE
+    _ce_ctx_fn = _ft_ce.partial(_cscc, _ce_policy)
+    print('[GC] Selective checkpoint CE enabled')
+# ===== End =====
+
+def chunked_lm_head_cross_entropy_fn(hidden_states, lm_head_weight, labels,
+    chunk_size=8192, ignore_index=-100, weight=None):
+    if hidden_states.ndim == 3:
+        B,S,H = hidden_states.shape; N = B*S
+    else:
+        N,H = hidden_states.shape
+    V = lm_head_weight.shape[0]; device = hidden_states.device; comp_dtype = hidden_states.dtype
+    running_max = torch.full((N,), -float("inf"), device=device, dtype=comp_dtype)
+    for i in range(0, V, chunk_size):
+        chunk_w = lm_head_weight[i:i+chunk_size]
+        chunk_l = F.linear(hidden_states, chunk_w)
+        if hidden_states.ndim == 3: chunk_l = chunk_l.reshape(-1, chunk_l.size(-1))
+        running_max = torch.maximum(running_max, chunk_l.max(dim=-1, keepdim=False)[0])
+    lse = torch.zeros(N, device=device, dtype=comp_dtype)
+    label_logit = torch.zeros(N, device=device, dtype=comp_dtype)
+    for i in range(0, V, chunk_size):
+        chunk_w = lm_head_weight[i:i+chunk_size]
+        chunk_l = F.linear(hidden_states, chunk_w)
+        if hidden_states.ndim == 3: chunk_l = chunk_l.reshape(-1, chunk_l.size(-1))
+        lse = lse + (chunk_l - running_max.unsqueeze(-1)).exp().sum(dim=-1)
+        in_chunk = (labels >= i) & (labels < i + chunk_size)
+        if in_chunk.any():
+            local_idx = labels[in_chunk] - i
+            label_logit = label_logit.scatter(0, in_chunk.nonzero(as_tuple=False).squeeze(-1), chunk_l[in_chunk, local_idx])
+    lse = lse.log() + running_max; nll = lse - label_logit
+    if weight is not None:
+        w = weight[labels.clamp(min=0)]; w = torch.where(labels == ignore_index, torch.zeros_like(w), w); nll = nll * w
+    mask = labels != ignore_index
+    return nll[mask].mean() if mask.any() else nll.sum() * 0
+
+def chunked_lm_head_cross_entropy_selective(hidden_states, lm_head_weight, labels,
+    chunk_size=8192, ignore_index=-100, weight=None):
+    return torch.utils.checkpoint.checkpoint(
+        chunked_lm_head_cross_entropy_fn,
+        hidden_states, lm_head_weight, labels,
+        chunk_size, ignore_index, weight,
+        use_reentrant=True)
+
 def chunked_lm_head_cross_entropy(
     hidden_states: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -1812,9 +1866,14 @@ class Emu3MoE(Emu3PreTrainedModel):
 
             if _timing:
                 _ev_lm = _timing_event_start()
-            loss = chunked_lm_head_cross_entropy(
-                hidden_shifted, self.lm_head.weight, shift_labels, weight=weight,
-            )
+            if _GC_SELECTIVE_CE:
+                loss = chunked_lm_head_cross_entropy_selective(
+                    hidden_shifted, self.lm_head.weight, shift_labels, weight=weight,
+                )
+            else:
+                loss = chunked_lm_head_cross_entropy(
+                    hidden_shifted, self.lm_head.weight, shift_labels, weight=weight,
+                )
             if _timing:
                 self._submodule_times['lm_head+loss'] = self._submodule_times.get('lm_head+loss', 0.0) + _timing_event_end(_ev_lm)
             if action is not None and self.action_experts:

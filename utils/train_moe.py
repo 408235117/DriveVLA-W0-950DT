@@ -137,6 +137,56 @@ def _install_grad_clip_hook():
 
 
 from monitor import build_monitor
+# ===== GC Diagnostic =====
+import os as _d_os, json as _d_json
+from collections import defaultdict as _d_dd
+_D=_d_os.environ.get('GC_DIAG','0')=='1'
+_DM=_d_os.environ.get('GC_DIAG_MODE','full_gc')
+_DS=int(_d_os.environ.get('GC_DIAG_STEPS','3'))
+_DL=_d_os.environ.get('GC_DIAG_LOG','/data2/z00543838/gc_diag.jsonl')
+_DC=[0]
+class _DT:
+    def __init__(s):s.tb=0;s.tc=0;s.ts=_d_dd(int);s.ctx=None;s.mb=0;s.ma=0
+    def pack(s,t):
+        z=t.numel()*t.element_size();s.tb+=z;s.tc+=1
+        # Track by shape+grad_fn for context
+        gn=type(t.grad_fn).__name__ if t.grad_fn else 'none'
+        if hasattr(t.grad_fn,'next_functions') and t.grad_fn.next_functions:
+            nf=t.grad_fn.next_functions
+            names=[]
+            for fn in nf[:3]:
+                if fn and fn[0]:
+                    names.append(type(fn[0]).__name__)
+            gn=gn+'<-'+','.join(names) if names else gn
+        key=str(tuple(t.shape))+'|'+gn
+        s.ts[key]+=z
+        return t
+    def unpack(s,p):return p
+    def reset(s):s.tb=0;s.tc=0;s.ts.clear()
+    def enter(s):
+        import torch;s.ctx=torch.autograd.graph.saved_tensors_hooks(s.pack,s.unpack);s.ctx.__enter__()
+    def exit(s):
+        if s.ctx:s.ctx.__exit__(None,None,None);s.ctx=None
+_T=_DT()
+def _DP():
+    global _T
+    if not _D or _DC[0]>=_DS:return
+    import torch,torch.npu;_T.reset();_T.mb=torch.npu.memory_allocated();_T.enter()
+def _DQ():
+    global _T
+    if not _D or _DC[0]>=_DS:return
+    import torch,torch.npu;_T.exit();_T.ma=torch.npu.memory_allocated()
+    sg=_T.tb/1e9;mb=_T.mb/1e9;ma=_T.ma/1e9;st=_DC[0]
+    ss=sorted(_T.ts.items(),key=lambda x:x[1],reverse=True);t10=[(s,b/1e6) for s,b in ss[:10]]
+    lg={'step':st,'mode':_DM,'mem_before_GB':round(mb,4),'mem_after_GB':round(ma,4),
+        'mem_delta_GB':round(ma-mb,4),'saved_GB':round(sg,4),'count':_T.tc,
+        'top10_MB':[(s,round(m,1)) for s,m in t10]}
+    with open(_DL,'a') as fw:_d_json.dump(lg,fw,ensure_ascii=False);fw.write('\n')
+    print(f"\n[GC_DIAG] step={st} mode={_DM} mem={mb:.3f}->{ma:.3f}GB delta={ma-mb:.3f}GB saved={sg:.3f}GB ({_T.tc} tensors)")
+    for s,m in t10:print(f"  {s}: {m:.1f}MB")
+    _DC[0]+=1
+# ===== End GC Diagnostic =====
+
 class _RawGradNormCallback(TrainerCallback):
     """Report the raw pre-clip global grad norm when --max_grad_norm is disabled.
 
@@ -481,6 +531,7 @@ class LoggingTrainer(tf.Trainer):
         # Pop the index first, since it's not a model input.
         indices = inputs.pop("index", None)
         # Pop VAVA-only keys that the model forward doesn't accept
+        _DP()
         self._strip_non_model_keys(inputs)
         # Count non-padding tokens in this batch for TPS logging.
         # Use input_ids.numel() rather than attention_mask.sum() because TPS
@@ -534,10 +585,13 @@ class LoggingTrainer(tf.Trainer):
         when the dataset adds VAVA / AR auxiliary keys.
         """
         self._strip_non_model_keys(inputs)
+        # GC_DIAG: start saved_tensors tracking before forward
+        _DP()
         # FLOPs: reset before forward, read after forward (before backward)
         if hasattr(self, '_flops') and self._flops.enabled:
             self._flops.reset()
         loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        _DQ()
         if hasattr(self, '_flops') and self._flops.enabled:
             self._last_flops = self._flops.model_training_flops
         return loss
