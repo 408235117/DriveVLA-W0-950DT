@@ -24,7 +24,7 @@ torchrun \
   --node_rank=${RANK} \
   --master_addr=${MASTER_ADDR} \
   --master_port=${MASTER_PORT} \
-  train/train_pi0.py \
+  utils/train_pi0.py \
   --model_name_or_path ${MODEL_NAME_OR_PATH} \
   --model_config_path ${MODEL_CONFIG_PATH} \
   --actions_format fast \

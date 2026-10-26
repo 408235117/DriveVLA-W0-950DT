@@ -326,7 +326,7 @@ torchrun \
     --node_rank=0 \
     --master_addr=127.0.0.1 \
     --master_port=${MASTER_PORT} \
-    train/train_moe.py \
+    utils/train_moe.py \
     --model_name_or_path "$MODEL_NAME_OR_PATH" \
     --model_config_path "$MODEL_CONFIG_PATH" \
     --actions_format fast \

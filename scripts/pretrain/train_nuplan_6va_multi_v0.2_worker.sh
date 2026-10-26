@@ -141,7 +141,7 @@ torchrun \
     --node_rank=${RANK} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
-    train/train_moe.py \
+    utils/train_moe.py \
     --model_name_or_path ${MODEL_PATH} \
     --model_config_path ${CONFIG_PATH} \
     --actions_format fast \
