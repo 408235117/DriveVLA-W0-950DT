@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import pathlib
 import transformers as tf
-from datasets import Emu3SFTDataset
+from drivevla_datasets import Emu3SFTDataset
 import sys
 # 获取当前脚本的目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -18,9 +18,9 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(os.path.join(parent_dir, "reference", "Emu3"))
 from emu3.mllm import Emu3Config, Emu3Tokenizer, Emu3ForCausalLM, Emu3MoE, Emu3MoEConfig, Emu3Pi0, Emu3Pi0Config, Emu3QFormer
 from transformers import AutoModel,Trainer
-# from datasets import Emu3WorldModelDataset
-from datasets import Emu3DrivingDataset
-from datasets import Emu3DrivingVAVADataset
+# from drivevla_datasets import Emu3WorldModelDataset
+from drivevla_datasets import Emu3DrivingDataset
+from drivevla_datasets import Emu3DrivingVAVADataset
 from torch.utils.data import WeightedRandomSampler, DataLoader
 
 class WeightedSamplerTrainer(Trainer):

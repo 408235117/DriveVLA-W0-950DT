@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import pathlib
 import transformers as tf
-from datasets import Emu3SFTDataset
+from drivevla_datasets import Emu3SFTDataset
 import sys
 sys.path.append("/share/project/yuqi.wang/OmniSim/reference/Emu3")
 from emu3.mllm import Emu3Config, Emu3Tokenizer, Emu3ForCausalLM
