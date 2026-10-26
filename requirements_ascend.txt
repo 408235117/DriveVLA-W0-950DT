@@ -1,30 +1,60 @@
 #
-# Additional dependencies for Ascend NPU support.
+# Ascend NPU environment dependencies.
 #
-# Usage (after `conda activate drivevla`):
+# Usage:
 #   pip install -r requirements_ascend.txt
 #
-# ─── torch_npu ───────────────────────────────────────────────────────
+# This file is standalone — it does NOT reference requirements.txt.
+# requirements.txt is for CUDA-only environments.
+#
+
+# ─── torch_npu ────────────────────────────────────────────
 # Must match the installed CANN toolkit version.
-# CANN 8.5.1 → torch 2.7.1 → torch_npu 2.7.1.post4
+# CANN 9.2.0 → torch 2.11.0 → torch_npu 2.11.0.post1
 #
 # Install torch first, then torch_npu:
-#   pip install torch==2.7.1 torchvision==0.20.1 torchaudio==2.7.1 \
-#     --index-url https://download.pytorch.org/whl/cu128
-#   pip install torch_npu==2.7.1.post4
+#   pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+#     --index-url https://download.pytorch.org/whl/cpu
+#   pip install torch_npu==2.11.0.post1
 #
-# After installing, verify:
+# Verify:
 #   python -c "import torch, torch_npu; print(torch.npu.is_available())"
 #   → True
 #
 
 # ─── CANN toolkit (system-level, not pip) ────────────────────────────
-# Download CANN 8.5.1 from https://www.hiascend.com/software/cann/community
+# Download CANN 9.2.0 from https://www.hiascend.com/software/cann/community
 # Install per your OS, then source the env:
-#   source /usr/local/Ascend/ascend-toolkit/set_env.sh
+#   source /usr/local/Ascend/cann-9.2.0/set_env.sh
 
-# ─── optional but recommended for NPU training ──────────────────────
+# ─── Core dependencies ─────────────────────────────────────────────
 transformers[torch]==4.44.0
 tiktoken==0.6.0
 pillow
-gradio==4.44.0
+deepspeed==0.19.7
+accelerate==1.15.0
+numpy==1.26.4
+safetensors==0.8.0
+tokenizers==0.19.1
+einops==0.8.2
+scipy==1.13.1
+
+# ─── NPU specific ───────────────────────────────────────────────────
+triton-ascend==3.6.0
+
+# ─── Monitoring & logging ─────────────────────────────────────────
+tensorboard==2.21.0
+wandb==0.28.1
+
+# ─── Note: datasets package ───────────────────────────────────────
+# HuggingFace datasets (5.0.1) is installed as a transitive dependency
+# of transformers[torch]. It conflicts with the local utils/datasets.py
+# filename, so the local file is renamed to utils/drivevla_datasets.py.
+# Do NOT rename it back to datasets.py.
+
+# ─── Note: msprobe ───────────────────────────────────────────
+# msprobe is not available via pip. It is provided by MindStudio Precision
+# Toolkit and must be installed separately:
+#   pip install msprobe  (if available from internal registry)
+# or manually copy to site-packages/msprobe/
+# train_moe.py imports msprobe.pytorch.seed_all at line 1.
