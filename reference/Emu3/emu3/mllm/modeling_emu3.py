@@ -102,6 +102,184 @@ if _GC_SELECTIVE_CE:
     print('[GC] Selective checkpoint CE enabled')
 # ===== End =====
 
+# ===== Fused chunked lm_head + CE: 1-pass online logsumexp + Liger backward =====
+# Cuts lm_head matmuls per step ~3x -> ~1.5x: drops the redundant forward
+# max-pass (max is a stop-gradient for the lse, so pass 1 contributes zero loss
+# gradient yet still burns a full vocab scan) AND replaces autograd's
+# double-recompute backward with a single Liger-style recompute. Direct MFU
+# win on a compute-bound step (step is 98.6% compute, comm fully overlapped).
+# HBM-neutral: saves only hidden_states [N,H] (~335 MiB) + lse [N] (fp32),
+# never materialises the full [N,V] logits (~13 GiB). Accumulates lse in fp32
+# (strictly more accurate than the bf16 reference). Env flag to enable.
+_FUSED_CE = _os_ce.environ.get('EMU3_FUSED_CE', '0') == '1'
+if _FUSED_CE:
+    from emu3.mllm.fused_chunked_ce import fused_chunked_linear_cross_entropy
+    print('[CE] Fused chunked linear cross-entropy enabled (1-pass online lse + Liger backward)')
+# ===== End =====
+
+# ===== Candidate-1: merge gate/up weights -> single MatMul + npu_swiglu (no Cat) =====
+# Replaces: gate=gate_proj(x); up=up_proj(x); fused_swiglu(gate,up)
+#           (= npu_swiglu(cat([gate,up],dim=-1)))   [2 MatMul + Cat + SwiGlu]
+# With:     W_fused=cat([W_gate,W_up],dim=0); gu=F.linear(x,W_fused); npu_swiglu(gu)
+#           [1 big MatMul + SwiGlu, no Cat]. gu == cat([gate,up],dim=-1) exactly, so
+#           npu_swiglu semantics (A=front=gate, B=back=up) are preserved.
+# Differentiable end-to-end: autograd splits grad_W_fused back to W_gate/W_up for free
+# (cat backward = slice = view, no copy). W_fused saved for backward (235MB/layer, 7.5GB
+# total — within 30GB free). Merge happens once per forward per layer (cat of params).
+# Note: per real-shape microbench (bench_fused_mlp.py) this is faster fwd+bwd at N=40960
+# but the wall-clock gain in real training is uncertain (Cat may be overlapped per the
+# profiling lesson); the env flag lets the smoke test decide. Pure PyTorch, no cannbot.
+_FUSED_GATEUP = _os_ce.environ.get('EMU3_FUSED_GATEUP', '0') == '1'
+if _FUSED_GATEUP:
+    print('[MLP] Candidate-1 fused gate/up (single MatMul + npu_swiglu, no Cat) enabled')
+# ===== End =====
+
+# ===== Fused QKV: merge q/k/v weights -> single MatMul (mm-count Cube-util gain) =====
+# Replaces: q=q_proj(x); k=k_proj(x); v=v_proj(x)   [3 small MatMul]
+# With:     W_qkv=cat([Wq,Wk,Wv],dim=0); qkv=F.linear(x,W_qkv); split q/k/v
+#           [1 big MatMul, no output Cat]. qkv==cat([q,k,v],dim=-1) exactly.
+# Same mechanism as candidate-1 (3 small mm -> 1 big mm raises Cube utilization),
+# NOT an overlapped-Cat elimination (that gives ~0 per profiling lesson §11.1).
+# Differentiable end-to-end: autograd splits grad_W_qkv back to Wq/Wk/Wv for free
+# (cat backward = slice = view, no copy). qkv_bias=False (Emu3-Stage1 verified),
+# so no bias to cat. Slices are .contiguous()-ed before the .view() (last-dim slice
+# of [B,S,6144] is non-contiguous -> .view would crash). Env flag to enable.
+# Microbench (bench_fused_qkv.py): +0.93ms/layer x32 = ~+0.46pp wall-clock.
+_FUSED_QKV = _os_ce.environ.get('EMU3_FUSED_QKV', '0') == '1'
+if _FUSED_QKV:
+    print('[ATTN] Fused QKV (single MatMul on cat([Wq,Wk,Wv]) -> split, no Cat) enabled')
+# ===== End =====
+
+# ===== Layer-wise selective recompute: skip checkpoint on last N layers =====
+# GC_SKIP_LAST_LAYERS=N: the last N decoder layers are NOT checkpointed
+# (activations kept, no recompute); the rest still use full-layer GC.
+# Default 0 = all layers recompute (current behavior). Trades HBM for MFU.
+# Last-N chosen over first-N: later-layer activations are held for a shorter
+# time (backward reaches them first), so peak HBM stays lower.
+_GC_SKIP_LAST = int(_os_ce.environ.get('GC_SKIP_LAST_LAYERS', '0'))
+if _GC_SKIP_LAST > 0:
+    print(f'[GC] Layer-wise selective recompute: skipping checkpoint on last {_GC_SKIP_LAST} layers')
+# ===== End =====
+
+# ===== Selective checkpoint save-qkv: skip qkv-proj forward recompute in backward =====
+# Under full-layer GC, backward recomputes the whole layer forward (incl. qkv proj).
+# This MUST_SAVEs the qkv-proj mm (q/k/v + o) and MUST_RECOMPUTEs everything else (FA,
+# mlp mm), so backward skips the qkv-proj forward recompute. Bench-confirmed
+# (bench_qkv_overlap.py, real shape N=40960): qkv forward recompute is ~49.7% of the
+# attn block wall-clock and NOT overlapped by FA (qkv is upstream of FA) => skipping it
+# is real ~+1.4pp (same mechanism class as save-logits: HBM-for-compute on a compute-
+# bound step). HBM: only qkv (q/k/v+o) proj outputs are saved (~838MB/layer), freed
+# per-layer in reentrant backward (peak ~+2GB, NOT all layers at once) => 66.27->~68GB.
+# Policy keys on mm weight shape so it survives candidate-1 / qkv-merge rewrites:
+# q/o=(4096,4096), k/v=(1024,4096), merged-qkv=(6144,4096); mlp gate/up=(28672,4096),
+# down=(4096,14336) fall through to MUST_RECOMPUTE. o_proj is co-saved (same shape as
+# q_proj; its recompute saving is ~0 but it costs only per-layer freed HBM).
+_GC_SAVE_QKV = _os_ce.environ.get('EMU3_SAVE_QKV', '0') == '1'
+if _GC_SAVE_QKV:
+    import functools as _ft_sq
+    from torch.utils.checkpoint import CheckpointPolicy as _CP2, create_selective_checkpoint_contexts as _cscc2
+    # Match qkv-proj weights by SORTED dims so it is robust to weight orientation: F.linear
+    # decomposes to aten::mm(x, W.t()) where the mm sees the TRANSPOSED weight (in,out)=
+    # (4096,1024) for k/v, not the stored (out,in)=(1024,4096); but if it stays as
+    # aten::linear (undecomposed) the weight is (out,in). sorted() collapses both: q/o->
+    # {4096,4096}, k/v->{1024,4096}, merged-qkv->{4096,6144}. mlp gate/up (11008/22016 x
+    # 4096) and down (4096x14336) never collide. Covers mm/addmm/linear (weight at a[1]
+    # for mm/linear, a[2] for addmm).
+    _SAVE_QKV_SORTED = frozenset({(4096, 4096), (1024, 4096), (4096, 6144)})
+    # F.linear on this torch_npu stack decomposes to aten.matmul + aten.t (NOT aten.mm);
+    # keep mm/addmm/linear too for robustness. weight is a[1] for mm/matmul/linear, a[2] for addmm.
+    _QKV_MM_OPS = (torch.ops.aten.mm.default, torch.ops.aten.matmul.default,
+                   torch.ops.aten.addmm.default, torch.ops.aten.linear.default)
+    # NOOP diagnostic: context_fn stays engaged but saves nothing (all MUST_RECOMPUTE) to
+    # isolate whether context_fn machinery itself is incompatible with DeepSpeed ZeRO-2
+    # (=> pivot to manual save-qkv) vs MUST_SAVE specifically (=> different debug path).
+    _SAVE_QKV_NOOP = _os_ce.environ.get('EMU3_SAVE_QKV_NOOP', '0') == '1'
+    def _save_qkv_policy(ctx, op, *a, **kw):
+        if _SAVE_QKV_NOOP:
+            return _CP2.MUST_RECOMPUTE
+        if op not in _QKV_MM_OPS:
+            return _CP2.MUST_RECOMPUTE
+        # weight tensor location differs by op: mm/matmul/linear -> a[1]; addmm -> a[2]
+        if op == torch.ops.aten.addmm.default:
+            w = a[2] if len(a) > 2 else None
+        else:
+            w = a[1] if len(a) > 1 else None
+        if w is not None and getattr(w, 'ndim', 0) == 2 \
+                and tuple(sorted(tuple(w.shape))) in _SAVE_QKV_SORTED:
+            return _CP2.MUST_SAVE
+        return _CP2.MUST_RECOMPUTE
+    _save_qkv_ctx_fn = _ft_sq.partial(_cscc2, _save_qkv_policy)
+    print('[GC] Selective checkpoint save-qkv enabled (skip qkv-proj forward recompute in backward)')
+# ===== End =====
+
+# ===== Cross-layer fused residual chain (EMU3_FUSED_RESIDUAL_CHAIN) =====
+# prof_54: each decoder layer ENDS with a bare Add (residual + dropout(mlp_out),
+# Add x128/step = 39.7ms) whose result feeds the NEXT layer's independent
+# input_layernorm RmsNorm (standalone RmsNorm x65/step = 15.0ms). Only the
+# post-attention site is fused today (InplaceAddRmsNorm x64 = 32 layers x
+# (fwd + recompute)) — the MLP-output site is not.
+# This flag makes each layer return (dropout(mlp_out), residual_stream) and
+# fuses the deferred Add into the NEXT layer's input RMSNorm via the SAME
+# npu_add_rms_norm_v2_functional kernel already used post-attention — extending
+# coverage from 1 to 2 fused residual sites per layer. The LAST layer's
+# deferred Add is fused into the model's final norm.
+# Numerics: dropout is applied to mlp_out exactly once, BEFORE the Add — same
+# order as the old path; the Add itself is the same bf16 add inside the fused
+# kernel that the 54% baseline already accepts at the post-attn site.
+# Guard (Emu3Model): output_hidden_states / use_cache / output_attentions off.
+# GC (use_reentrant=False): residual is a positional arg through checkpoint,
+# so the recompute path follows the chain too.
+# VERDICT (probe_addnorm.py v3, dev3, /tmp/probe_addnorm_dev3_v3.log): FALSIFIED.
+#   npu_add_rms_norm_v2_functional emits ~2.6 TensorMove per call even with both
+#   inputs contiguous (78 TM / 30 calls, avg 246.5us) — the double copy is
+#   INHERENT to the functional wrapper (the in-place base op needs both inputs
+#   cloned). Per site: fused 1092.5us (TM 640.8 + InplaceAddRmsNorm 451.7) vs
+#   old path 645.3us (Add 376.3 + RmsNorm 269.0) => each NEW fused site LOSES
+#   ~447us; 32 layers x fwd+recompute => net ~ -16 ms/step. The 25.91ms TM in
+#   prof_54 is the cost the post-attn site ALREADY pays, not recoverable by the
+#   chain. EMU3_FUSED_RESIDUAL_CHAIN stays default OFF; code kept for a future
+#   op with an out-of-place backward-registered variant.
+# BONUS FINDING (same probe): npu_add_rms_norm_v2_functional has NO autograd
+#   registration — its fallback backward is pure identity passthrough (dx=gy,
+#   dr=gs exactly; |dx-gy|max=0.0) and dw=None (post-attn weight grad missing).
+#   This affects the 54% BASELINE post-attention fused site (via
+#   npu_fused_ops.fused_add_rms_norm, which has no custom backward). Fix path
+#   (numerics verified): wrap in a custom autograd.Function using the v2 forward
+#   (returns rstd) + torch.ops.npu.npu_rms_norm_backward(gy, x_back, gamma,
+#   rstd) with dx = dr = ds + gs. See scripts_analysis/probe_addnorm.py sec.1
+#   (npu_rms_norm_backward ds rel 0.2%, dw rel 0.0%).
+_FUSED_RESIDUAL_CHAIN = _os_ce.environ.get('EMU3_FUSED_RESIDUAL_CHAIN', '0') == '1'
+if _FUSED_RESIDUAL_CHAIN:
+    print('[RESIDUAL] Cross-layer fused residual chain enabled (deferred MLP-out Add -> next layer fused input Add+RMSNorm, fused final norm)')
+# ===== End =====
+
+# ===== Pi0 shared-layer FA (EMU3_PI0_FA) =====
+# Emu3Pi0SharedLayer.forward / forward_with_cache 注意力路径切换到 npu_fusion_attention:
+#   - input_layout="BSND": 消除输入 view 后的 transpose(1,2) 链与输出 transpose(1,2).contiguous()
+#   - 原生 GQA (head_num=查询头数 32, k/v 保留 8 头): 消除 repeat_kv 8->32 的物化与三次 .contiguous()
+#   - atten_mask 布尔化: additive [B,1,S,S] (0.0 / finfo.min/2) -> (mask < 0), True=屏蔽
+#     (与 SDPA attn_mask True=参与 语义相反, probe_pi0_fa.py 实测 FA 输出与 SDPA(~m) 精确一致)
+# 实测依据 scripts_analysis/probe_pi0_fa.py (24/29 PASS): BSND=BNSD 数值一致;
+# bool mask [B,1,S,S] / [1,1,S,S] / [B,H,S,S] / 非方阵 [B,1,A,S_total] 均可用
+# ([S,S] 与 [1,H,S,S] 报 161001, 本路径不使用); bwd 梯度违例=0 (bf16 atol=rtol=1e-2)。
+# 默认 '0' 走原 SDPA 路径, 对外接口(输入输出 shape/语义)完全不变。
+_PI0_FA = _os_ce.environ.get('EMU3_PI0_FA', '0') == '1'
+if _PI0_FA:
+    from torch_npu import npu_fusion_attention as _npu_fa_pi0
+    print('[ATTN] Pi0 shared-layer npu_fusion_attention enabled (BSND + native GQA + bool mask)')
+
+# additive->bool mask 单槽身份缓存: mask 每个 step 构造一次、32 层复用同一张量对象
+# (GC 传参 + recompute 传入同对象仍命中); 持有 src 引用防止 id 复用误判。
+_PI0_FA_MASK_CACHE = {'fwd_src': None, 'fwd_bool': None, 'fwc_src': None, 'fwc_bool': None}
+
+def _pi0_fa_bool_mask(mask, slot):
+    _c = _PI0_FA_MASK_CACHE
+    if _c[slot + '_src'] is not mask:
+        _c[slot + '_src'] = mask
+        _c[slot + '_bool'] = (mask < 0)
+    return _c[slot + '_bool']
+# ===== End =====
+
 def chunked_lm_head_cross_entropy_fn(hidden_states, lm_head_weight, labels,
     chunk_size=8192, ignore_index=-100, weight=None):
     if hidden_states.ndim == 3:
@@ -468,6 +646,18 @@ class Emu3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
+    def _mfu_extra_flops(self, inputs):
+        """Forward FLOPs of the candidate-1 fused gate/up MatMul, for the FlopsCounter.
+        Candidate-1 does F.linear(x, cat([W_gate,W_up])) directly, bypassing the
+        gate_proj/up_proj nn.Linear modules, so the counter's Linear hook misses them.
+        Returns 2*rows*H*(2I) == gate_proj(2*rows*H*I) + up_proj(2*rows*H*I). Returns
+        0 when candidate-1 is off (the gate_proj/up_proj Linear hooks then count them).
+        """
+        if not _FUSED_GATEUP:
+            return 0
+        rows = inputs[0].numel() // self.hidden_size
+        return 2.0 * rows * self.hidden_size * (2 * self.intermediate_size)
+
     def forward(self, x):
         if self.config.pretraining_tp > 1:
             slice = self.intermediate_size // self.config.pretraining_tp
@@ -486,13 +676,23 @@ class Emu3MLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            gate = self.gate_proj(x)
-            up = self.up_proj(x)
-            fused = fused_swiglu(gate, up)
-            if fused is not None:
+            if _FUSED_GATEUP:
+                # Candidate-1: single big MatMul on merged [W_gate; W_up] -> [N,2I],
+                # then npu_swiglu (A=gate=front, B=up=back). Eliminates the per-forward
+                # Cat([gate,up]). Differentiable: autograd splits grad back to the two
+                # params for free. Equivalent to the fused_swiglu path (gu==cat([gate,up])).
+                w_fused = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+                gu = F.linear(x, w_fused)
+                fused = torch_npu.npu_swiglu(gu, dim=-1)
                 down_proj = self.down_proj(fused)
             else:
-                down_proj = self.down_proj(self.act_fn(gate) * up)
+                gate = self.gate_proj(x)
+                up = self.up_proj(x)
+                fused = fused_swiglu(gate, up)
+                if fused is not None:
+                    down_proj = self.down_proj(fused)
+                else:
+                    down_proj = self.down_proj(self.act_fn(gate) * up)
 
         return down_proj
 
@@ -979,11 +1179,35 @@ class Emu3SdpaAttention(Emu3Attention):
 
 class Emu3NpuFusionAttention(Emu3Attention):
     """NPU-native FlashAttention via npu_flash_attn_func (npu_fusion_attention with causal mask + GQA + dtype fix)"""
+    def _mfu_extra_flops(self, inputs):
+        """Forward FLOPs of the fused-QKV MatMul, for the FlopsCounter.
+        Fused-QKV does F.linear(x, cat([Wq,Wk,Wv])) directly, bypassing the
+        q_proj/k_proj/v_proj nn.Linear modules, so the counter's Linear hook
+        misses them. Returns 2*rows*H*(Hq+2*Hkv) == q+k+v proj sum. Returns 0
+        when fused-QKV is off (the q_proj/k_proj/v_proj Linear hooks then count
+        them). Same pattern as Emu3MLP._mfu_extra_flops (candidate-1)."""
+        if not _FUSED_QKV:
+            return 0
+        hs = self.hidden_size
+        rows = inputs[0].numel() // hs
+        out_dim = self.num_heads * self.head_dim + 2 * self.num_key_value_heads * self.head_dim
+        return 2.0 * rows * hs * out_dim
+
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
         bsz, q_len, _ = hidden_states.size()
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        if _FUSED_QKV:
+            w_qkv = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
+            qkv = F.linear(hidden_states, w_qkv)
+            _hq = self.num_heads * self.head_dim
+            _hkv = self.num_key_value_heads * self.head_dim
+            # last-dim slices of [B,S,Hq+2Hkv] are non-contiguous -> .contiguous() before .view()
+            q = qkv[..., :_hq].contiguous()
+            k = qkv[..., _hq:_hq + _hkv].contiguous()
+            v = qkv[..., _hq + _hkv:].contiguous()
+        else:
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
         q = q.view(bsz, q_len, self.num_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         v = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
@@ -1032,6 +1256,8 @@ class Emu3DecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        residual: Optional[torch.Tensor] = None,
+        return_residual: bool = False,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1047,6 +1273,18 @@ class Emu3DecoderLayer(nn.Module):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+            residual (`torch.FloatTensor`, *optional*): residual stream from the previous layer
+                under the cross-layer fused residual chain (`EMU3_FUSED_RESIDUAL_CHAIN`).
+                When given, this layer fuses the previous layer's deferred Add into its
+                input Add+RMSNorm (`npu_add_rms_norm_v2_functional`) instead of computing
+                a bare Add + independent input RmsNorm. `None` (default) keeps the legacy
+                path, so all pre-existing call sites are unaffected.
+            return_residual (`bool`, defaults to `False`): when True, return
+                `(dropout(mlp_out), residual_stream)` — i.e. defer the final residual Add
+                to the consumer (next layer's fused input Add+RMSNorm or the model's fused
+                final norm). Only ever set by `Emu3Model` under the chain guard (no
+                hidden-state collection / KV cache / attention weights), so the returned
+                tuple layout stays unambiguous.
         """
         if "padding_mask" in kwargs:
             warnings.warn(
@@ -1057,9 +1295,20 @@ class Emu3DecoderLayer(nn.Module):
         if _timing:
             _ev_total = _timing_event_start()
 
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is not None:
+            # Cross-layer fused residual chain: the previous layer deferred its output
+            # Add; fuse it into THIS layer's input RMSNorm (one fused kernel replaces
+            # bare-Add + independent input RmsNorm). fused_in = (normed, x_back=sum).
+            # Fallback keeps the exact old math: sum in bf16, then layernorm.
+            fused_in = fused_add_rms_norm(hidden_states, residual, self.input_layernorm.weight, self.input_layernorm.variance_epsilon)
+            if fused_in is not None:
+                hidden_states, residual = fused_in
+            else:
+                residual = residual + hidden_states
+                hidden_states = self.input_layernorm(residual)
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         if _timing:
@@ -1089,7 +1338,13 @@ class Emu3DecoderLayer(nn.Module):
         if _timing:
             _ev_mlp = _timing_event_start()
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + self.dropout(hidden_states)
+        if return_residual:
+            # Chain mode: defer the residual Add to the consumer (next layer's fused
+            # input Add+RMSNorm, or the model's fused final norm). dropout on mlp_out
+            # is applied here EXACTLY ONCE, BEFORE the Add — same order as old path.
+            hidden_states = self.dropout(hidden_states)
+        else:
+            hidden_states = residual + self.dropout(hidden_states)
         if _timing:
             self._submodule_times['mlp'] = self._submodule_times.get('mlp', 0.0) + _timing_event_end(_ev_mlp)
 
@@ -1097,6 +1352,11 @@ class Emu3DecoderLayer(nn.Module):
             self._submodule_times['total'] = self._submodule_times.get('total', 0.0) + _timing_event_end(_ev_total)
 
         outputs = (hidden_states,)
+        if return_residual:
+            # chain mode: (dropout(mlp_out), residual_stream); only emitted when
+            # use_cache/output_attentions are off (Emu3Model chain guard) so the
+            # tuple layout stays unambiguous.
+            outputs += (residual,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -1346,20 +1606,56 @@ class Emu3Model(Emu3PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        # Cross-layer fused residual chain (EMU3_FUSED_RESIDUAL_CHAIN): each layer
+        # defers its output Add and the NEXT layer fuses it into its input
+        # Add+RMSNorm; the LAST layer's deferred Add is fused into the final norm.
+        # Guards keep the layer-output tuple layout unambiguous (no hidden-state
+        # collection / KV cache / attention weights) — those paths stay legacy.
+        _chain = (_FUSED_RESIDUAL_CHAIN and not output_hidden_states
+                  and not use_cache and not output_attentions)
+        residual_carry = None
+
+        _num_layers = len(self.layers)
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                )
+            # Layer-wise selective recompute: last N layers skip checkpoint
+            # (keep activations, no recompute) to trade HBM for MFU.
+            _use_ckpt = (self.gradient_checkpointing and self.training
+                         and not (layer_idx >= _num_layers - _GC_SKIP_LAST))
+            if _use_ckpt:
+                if _GC_SAVE_QKV:
+                    # Selective-checkpoint: MUST_SAVE qkv-proj mm, MUST_RECOMPUTE the
+                    # rest (FA, mlp mm). Backward skips the qkv-proj forward recompute
+                    # (bench-confirmed ~+1.4pp). context_fn (selective contexts) REQUIRES
+                    # use_reentrant=False — which also matches the baseline GC_KWARGS, so
+                    # save-qkv is the only variable vs the candidate-1 baseline.
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        residual_carry if _chain else None,
+                        _chain,
+                        use_reentrant=False,
+                        context_fn=_save_qkv_ctx_fn,
+                    )
+                else:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        residual_carry if _chain else None,
+                        _chain,
+                    )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
@@ -1368,9 +1664,14 @@ class Emu3Model(Emu3PreTrainedModel):
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    residual=residual_carry if _chain else None,
+                    return_residual=_chain,
                 )
 
             hidden_states = layer_outputs[0]
+            if _chain:
+                # chain mode: the layer also returned the un-Added residual stream
+                residual_carry = layer_outputs[1]
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1380,7 +1681,18 @@ class Emu3Model(Emu3PreTrainedModel):
 
         if _timing:
             _ev_norm = _timing_event_start()
-        hidden_states = self.norm(hidden_states)
+        if _chain and residual_carry is not None:
+            # Chain mode: the last layer deferred its output Add — fuse it into the
+            # final RMSNorm with the same fused kernel used at every chain site.
+            # Fallback keeps the exact legacy math: bf16 add, then norm.
+            fused_final = fused_add_rms_norm(
+                hidden_states, residual_carry, self.norm.weight, self.norm.variance_epsilon)
+            if fused_final is not None:
+                hidden_states = fused_final[0]
+            else:
+                hidden_states = self.norm(residual_carry + hidden_states)
+        else:
+            hidden_states = self.norm(hidden_states)
         if _timing:
             self._submodule_times['norm'] = self._submodule_times.get('norm', 0.0) + _timing_event_end(_ev_norm)
 
@@ -1866,7 +2178,15 @@ class Emu3MoE(Emu3PreTrainedModel):
 
             if _timing:
                 _ev_lm = _timing_event_start()
-            if _GC_SELECTIVE_CE:
+            if _FUSED_CE:
+                # 1-pass online logsumexp forward + single-recompute Liger backward.
+                # ~1.5x lm_head matmuls vs ~3x for the two-pass reference; the
+                # redundant max-pass forward (zero loss gradient) is dropped and
+                # autograd's double backward recompute becomes a single pass.
+                loss = fused_chunked_linear_cross_entropy(
+                    hidden_shifted, self.lm_head.weight, shift_labels, weight=weight,
+                )
+            elif _GC_SELECTIVE_CE:
                 loss = chunked_lm_head_cross_entropy_selective(
                     hidden_shifted, self.lm_head.weight, shift_labels, weight=weight,
                 )
@@ -2108,43 +2428,83 @@ class Emu3Pi0SharedLayer:
         k_action = self.action_layer.self_attn.k_proj(normed_action_h)
         v_action = self.action_layer.self_attn.v_proj(normed_action_h)
 
-        q_vlm = q_vlm.view(batch_size, vlm_seq_len, _num_heads, _head_dim).transpose(1, 2)
-        k_vlm = k_vlm.view(batch_size, vlm_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
-        v_vlm = v_vlm.view(batch_size, vlm_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
+        if _PI0_FA:
+            # --- 新路径: npu_fusion_attention (BSND + 原生 GQA + bool mask) ---
+            # BSND 布局: 只 view 不 transpose(1,2), 消输入 transpose 链与输出
+            # transpose(1,2).contiguous(); k/v 保持 8 头交 FA 原生 GQA,
+            # 消 repeat_kv 8->32 物化与三次 .contiguous()。实测依据 probe_pi0_fa.py。
+            q_vlm = q_vlm.view(batch_size, vlm_seq_len, _num_heads, _head_dim)
+            k_vlm = k_vlm.view(batch_size, vlm_seq_len, _num_key_value_heads, _head_dim)
+            v_vlm = v_vlm.view(batch_size, vlm_seq_len, _num_key_value_heads, _head_dim)
 
-        q_action = q_action.view(batch_size, action_seq_len, _num_heads, _head_dim).transpose(1, 2)
-        k_action = k_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
-        v_action = v_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
+            q_action = q_action.view(batch_size, action_seq_len, _num_heads, _head_dim)
+            k_action = k_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim)
+            v_action = v_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim)
 
-        # Apply RoPE only to VLM part, not to action expert
-        cos, sin = self.vlm_layer.self_attn.rotary_emb(v_vlm, seq_len=vlm_seq_len)
-        q_vlm_rope, k_vlm_rope = apply_rotary_pos_emb(q_vlm, k_vlm, cos, sin, vlm_position_ids_original,
-                                                      unsqueeze_dim=1)
+            # Apply RoPE only to VLM part, not to action expert (BSND -> unsqueeze_dim=2)
+            cos, sin = self.vlm_layer.self_attn.rotary_emb(v_vlm, seq_len=vlm_seq_len)
+            q_vlm_rope, k_vlm_rope = apply_rotary_pos_emb(q_vlm, k_vlm, cos, sin, vlm_position_ids_original,
+                                                          unsqueeze_dim=2)
 
-        # Action expert does not use RoPE - keep original q_action, k_action  [2400, 2408] -> [1600, 1608]
-        combined_q = torch.cat([q_vlm_rope, q_action], dim=2)
-        combined_k = torch.cat([k_vlm_rope, k_action], dim=2)
-        combined_v = torch.cat([v_vlm, v_action], dim=2)
+            # Action expert does not use RoPE - keep original q_action, k_action
+            combined_q = torch.cat([q_vlm_rope, q_action], dim=1)
+            combined_k = torch.cat([k_vlm_rope, k_action], dim=1)
+            combined_v = torch.cat([v_vlm, v_action], dim=1)
 
-        combined_k_repeated = repeat_kv(combined_k, _num_key_value_groups)
-        combined_v_repeated = repeat_kv(combined_v, _num_key_value_groups)
+            # additive mask (填充值仅 0.0 / finfo.min/2) -> (mask < 0) bool, True=屏蔽
+            # (与 SDPA attn_mask True=参与 反相); mask 每 step 一张、32 层复用同一对象
+            # -> 单槽身份缓存每 step 只转换一次 (GC recompute 传同对象仍命中)。
+            attn_output_combined = _npu_fa_pi0(
+                combined_q,
+                combined_k,
+                combined_v,
+                _num_heads,
+                "BSND",
+                atten_mask=_pi0_fa_bool_mask(combined_attention_mask_4d, 'fwd'),
+                scale=1.0 / math.sqrt(_head_dim),
+                sparse_mode=0,
+            )[0]
 
-        combined_q = combined_q.contiguous()
-        combined_k_repeated = combined_k_repeated.contiguous()
-        combined_v_repeated = combined_v_repeated.contiguous()
+            total_seq_len = vlm_seq_len + action_seq_len
+            attn_output_combined = attn_output_combined.reshape(batch_size, total_seq_len, _hidden_size_attn_output)
+        else:
+            q_vlm = q_vlm.view(batch_size, vlm_seq_len, _num_heads, _head_dim).transpose(1, 2)
+            k_vlm = k_vlm.view(batch_size, vlm_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
+            v_vlm = v_vlm.view(batch_size, vlm_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
 
-        attn_output_combined = torch.nn.functional.scaled_dot_product_attention(
-            combined_q,
-            combined_k_repeated,
-            combined_v_repeated,
-            attn_mask=combined_attention_mask_4d,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+            q_action = q_action.view(batch_size, action_seq_len, _num_heads, _head_dim).transpose(1, 2)
+            k_action = k_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
+            v_action = v_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
 
-        attn_output_combined = attn_output_combined.transpose(1, 2).contiguous()
-        total_seq_len = vlm_seq_len + action_seq_len
-        attn_output_combined = attn_output_combined.reshape(batch_size, total_seq_len, _hidden_size_attn_output)
+            # Apply RoPE only to VLM part, not to action expert
+            cos, sin = self.vlm_layer.self_attn.rotary_emb(v_vlm, seq_len=vlm_seq_len)
+            q_vlm_rope, k_vlm_rope = apply_rotary_pos_emb(q_vlm, k_vlm, cos, sin, vlm_position_ids_original,
+                                                          unsqueeze_dim=1)
+
+            # Action expert does not use RoPE - keep original q_action, k_action  [2400, 2408] -> [1600, 1608]
+            combined_q = torch.cat([q_vlm_rope, q_action], dim=2)
+            combined_k = torch.cat([k_vlm_rope, k_action], dim=2)
+            combined_v = torch.cat([v_vlm, v_action], dim=2)
+
+            combined_k_repeated = repeat_kv(combined_k, _num_key_value_groups)
+            combined_v_repeated = repeat_kv(combined_v, _num_key_value_groups)
+
+            combined_q = combined_q.contiguous()
+            combined_k_repeated = combined_k_repeated.contiguous()
+            combined_v_repeated = combined_v_repeated.contiguous()
+
+            attn_output_combined = torch.nn.functional.scaled_dot_product_attention(
+                combined_q,
+                combined_k_repeated,
+                combined_v_repeated,
+                attn_mask=combined_attention_mask_4d,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+
+            attn_output_combined = attn_output_combined.transpose(1, 2).contiguous()
+            total_seq_len = vlm_seq_len + action_seq_len
+            attn_output_combined = attn_output_combined.reshape(batch_size, total_seq_len, _hidden_size_attn_output)
 
         attn_out_vlm = attn_output_combined[:, :vlm_seq_len, :]
         attn_out_action = attn_output_combined[:, vlm_seq_len:, :]
@@ -2196,33 +2556,59 @@ class Emu3Pi0SharedLayer:
         k_action = self.action_layer.self_attn.k_proj(normed_action_h)
         v_action = self.action_layer.self_attn.v_proj(normed_action_h)
 
-        q_action = q_action.view(batch_size, action_seq_len, _num_heads, _head_dim).transpose(1, 2)
-        k_action = k_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
-        v_action = v_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
+        if _PI0_FA:
+            # --- 新路径: npu_fusion_attention (BSND + 原生 GQA + bool mask) ---
+            # action 三流只 view 不 transpose; cache 为 BNSD [B, n_kv, S_vlm, D],
+            # transpose(1,2) 转 BSND 后与 action 流 cat dim=1。
+            # mask 为非方阵 [B,1,A,S_total] (probe Section D 实测可用), bool 化走独立槽 'fwc'。
+            q_action = q_action.view(batch_size, action_seq_len, _num_heads, _head_dim)
+            k_action = k_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim)
+            v_action = v_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim)
 
-        # Use cached VLM K/V and combine with real-time Action K/V
-        combined_k = torch.cat([vlm_k_rope_cached, k_action], dim=2)
-        combined_v = torch.cat([vlm_v_cached, v_action], dim=2)
+            # Use cached VLM K/V (BNSD -> BSND) and combine with real-time Action K/V
+            combined_k = torch.cat([vlm_k_rope_cached.transpose(1, 2), k_action], dim=1)
+            combined_v = torch.cat([vlm_v_cached.transpose(1, 2), v_action], dim=1)
 
-        combined_k_repeated = repeat_kv(combined_k, _num_key_value_groups)
-        combined_v_repeated = repeat_kv(combined_v, _num_key_value_groups)
+            attn_output_action = _npu_fa_pi0(
+                q_action,
+                combined_k,
+                combined_v,
+                _num_heads,
+                "BSND",
+                atten_mask=_pi0_fa_bool_mask(action_attention_mask, 'fwc'),
+                scale=1.0 / math.sqrt(_head_dim),
+                sparse_mode=0,
+            )[0]
 
-        q_action = q_action.contiguous()
-        combined_k_repeated = combined_k_repeated.contiguous()
-        combined_v_repeated = combined_v_repeated.contiguous()
+            attn_output_action = attn_output_action.reshape(batch_size, action_seq_len, _hidden_size_attn_output)
+        else:
+            q_action = q_action.view(batch_size, action_seq_len, _num_heads, _head_dim).transpose(1, 2)
+            k_action = k_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
+            v_action = v_action.view(batch_size, action_seq_len, _num_key_value_heads, _head_dim).transpose(1, 2)
 
-        # Attention with Action Q and combined K/V
-        attn_output_action = torch.nn.functional.scaled_dot_product_attention(
-            q_action,
-            combined_k_repeated,
-            combined_v_repeated,
-            attn_mask=action_attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+            # Use cached VLM K/V and combine with real-time Action K/V
+            combined_k = torch.cat([vlm_k_rope_cached, k_action], dim=2)
+            combined_v = torch.cat([vlm_v_cached, v_action], dim=2)
 
-        attn_output_action = attn_output_action.transpose(1, 2).contiguous()
-        attn_output_action = attn_output_action.reshape(batch_size, action_seq_len, _hidden_size_attn_output)
+            combined_k_repeated = repeat_kv(combined_k, _num_key_value_groups)
+            combined_v_repeated = repeat_kv(combined_v, _num_key_value_groups)
+
+            q_action = q_action.contiguous()
+            combined_k_repeated = combined_k_repeated.contiguous()
+            combined_v_repeated = combined_v_repeated.contiguous()
+
+            # Attention with Action Q and combined K/V
+            attn_output_action = torch.nn.functional.scaled_dot_product_attention(
+                q_action,
+                combined_k_repeated,
+                combined_v_repeated,
+                attn_mask=action_attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+
+            attn_output_action = attn_output_action.transpose(1, 2).contiguous()
+            attn_output_action = attn_output_action.reshape(batch_size, action_seq_len, _hidden_size_attn_output)
 
         # Zero-out outputs for padded action query positions to avoid numerical artifacts
         if action_query_valid_1d is not None:

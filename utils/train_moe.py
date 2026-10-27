@@ -763,6 +763,15 @@ def load_model(model_args, model_config, training_args):
     if _device_type == "npu" and attn_impl == "npu_fusion":
         from emu3.mllm.npu_flash_attention import npu_flash_attn_func
         from emu3.mllm.modeling_emu3 import apply_rotary_pos_emb
+        # EMU3_ATTN_BSH=1: native-BSH attention pipeline. q/k/v stay [B,S,H,D]
+        # contiguous (no .transpose(1,2)), RoPE broadcast via unsqueeze_dim=2,
+        # FA called with 3D "BSH" inputs ([B,S,H*D], head_dim passed explicitly),
+        # output [B,S,H*D] feeds o_proj directly. Removes every layout transpose
+        # in the chain (the non-contiguous BSND path pays ~5 TransposeAiCore
+        # kernels/layer-pass inside the ACL ops: rotary / FA fwd / FA bwd /
+        # contiguous / inplace-copy, ~67ms/step kernel-time nominal — see
+        # scripts_analysis/probe_attn_layout.py, bsh pipeline: Transpose n=0).
+        _attn_bsh = os.environ.get("EMU3_ATTN_BSH", "0") == "1"
 
         def _npu_fusion_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
             bsz, q_len, _ = hidden_states.size()
@@ -785,10 +794,37 @@ def load_model(model_args, model_config, training_args):
             attn_output = self.o_proj(attn_output)
             return attn_output, None, past_key_value
 
+        def _npu_fusion_forward_bsh(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False):
+            bsz, q_len, _ = hidden_states.size()
+            # [B,S,H,D] contiguous views of the projection outputs — no transpose.
+            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
+            key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            kv_seq_len = key_states.shape[1]  # BSHD: seq sits on dim 1
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos.to(query_states.dtype), sin.to(key_states.dtype),
+                position_ids, unsqueeze_dim=2)
+            # Flatten back to [B,S,H*D] (zero-copy view; RoPE output of a
+            # contiguous input stays contiguous — reshape fallback is a guard).
+            query_states = query_states.view(bsz, q_len, -1) if query_states.is_contiguous() else query_states.reshape(bsz, q_len, -1)
+            key_states = key_states.view(bsz, q_len, -1) if key_states.is_contiguous() else key_states.reshape(bsz, q_len, -1)
+            value_states = value_states.reshape(bsz, q_len, -1)
+            scale = 1.0 / (self.head_dim ** 0.5)
+            attn_output = npu_flash_attn_func(
+                query_states, key_states, value_states,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                softmax_scale=scale, causal=True, head_dim=self.head_dim)
+            attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+            attn_output = self.o_proj(attn_output)
+            return attn_output, None, past_key_value
+
+        _attn_fwd = _npu_fusion_forward_bsh if _attn_bsh else _npu_fusion_forward
         import types
         for layer in model.model.layers:
-            layer.self_attn.forward = types.MethodType(_npu_fusion_forward, layer.self_attn)
-        print("[NPU] Monkey-patched to npu_fusion attention (via npu_flash_attn_func)")
+            layer.self_attn.forward = types.MethodType(_attn_fwd, layer.self_attn)
+        print(f"[NPU] Monkey-patched to npu_fusion attention (via npu_flash_attn_func, "
+              f"layout={'BSH' if _attn_bsh else 'BSND'})")
 
     # Training best-practices:
     #   1. Disable KV cache — wasteful during training (no generation),

@@ -17,17 +17,36 @@ def get_attn_mask_npu(device, seq_len=2048):
         ATTN_MASK_NPU_CACHE[key] = torch.triu(torch.ones([seq_len, seq_len], device=device), diagonal=1).bool()
     return ATTN_MASK_NPU_CACHE[key]
 
-def npu_flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, **kwargs):
-    keep_prob = 1.0 - dropout_p
-    if softmax_scale is None:
-        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    if not causal:
+def npu_flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, head_dim=None, **kwargs):
+    """Flash attention wrapper (output-only, no lse/seed).
+
+    Accepts 4D BSND [B,S,H,D] (original behavior, unchanged) or 3D BSH
+    [B,S,H*D] (EMU3_ATTN_BSH pipeline). For 3D input, ``head_dim`` must be
+    passed explicitly to disambiguate the H*D split (e.g. head_dim=128 ->
+    head_num = H*D // 128); 4D input ignores it. The GQA kv head count is
+    inferred by the kernel from k/v's layout, exactly as before.
+    """
+    if q.dim() == 3:
+        # BSH: [B, S, H*D] — head_num needs an explicit head_dim to split on.
+        if head_dim is None:
+            raise ValueError(
+                "npu_flash_attn_func: 3D (BSH) input requires head_dim= "
+                "(H*D split is ambiguous from shape alone)")
+        head_num = q.shape[-1] // head_dim
+        layout = "BSH"
+        scale_dim = head_dim
+    else:
         head_num = q.shape[2]
-        return npu_fusion_attention(q, k, v, head_num, "BSND", keep_prob=keep_prob, scale=softmax_scale)[0]
+        layout = "BSND"
+        scale_dim = q.shape[-1]
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(scale_dim)
+    keep_prob = 1.0 - dropout_p
+    if not causal:
+        return npu_fusion_attention(q, k, v, head_num, layout, keep_prob=keep_prob, scale=softmax_scale)[0]
     else:
         attn_mask_npu = get_attn_mask_npu(q.device, max(q.shape[1], k.shape[1]))
-        head_num = q.shape[2]
-        return npu_fusion_attention(q, k, v, head_num, "BSND", keep_prob=keep_prob,
+        return npu_fusion_attention(q, k, v, head_num, layout, keep_prob=keep_prob,
                                     scale=softmax_scale, atten_mask=attn_mask_npu, sparse_mode=SPARSE_MODE)[0]
 
 def npu_flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
