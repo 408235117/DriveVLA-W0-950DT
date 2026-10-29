@@ -262,7 +262,7 @@ class NpuProfilerCallback(TrainerCallback):
                 with_stack=False,
                 record_shapes=True,
                 profile_memory=False,
-                schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=16),
+                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=30, repeat=1, skip_first=0),
                 experimental_config=torch_npu.profiler._ExperimentalConfig(
                     profiler_level=torch_npu.profiler.ProfilerLevel.Level1
                 ),
@@ -270,7 +270,7 @@ class NpuProfilerCallback(TrainerCallback):
             )
         return torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU],
-            schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=16),
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=30, repeat=1, skip_first=0),
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(self._trace_dir),
         )
 
@@ -590,7 +590,25 @@ class LoggingTrainer(tf.Trainer):
         # FLOPs: reset before forward, read after forward (before backward)
         if hasattr(self, '_flops') and self._flops.enabled:
             self._flops.reset()
-        loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        _cal = os.environ.get("DRIVEVLA_FLOP_CALIBRATE", "0") == "1"
+        if _cal and hasattr(self, "_flops") and self._flops.enabled:
+            from torch.utils.flop_counter import FlopCounterMode as _FCM
+            _fcm = _FCM(display=False)
+            _fcm.__enter__()
+            loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+            _fcm.__exit__(None, None, None)
+            _hf = self._flops.forward_flops_trainable
+            _ft = _fcm.get_total_flops()
+            _r = _hf / _ft if _ft > 0 else 0
+            print(f"[CALIB] hook={_hf:.3e} FCM={_ft:.3e} ratio={_r:.3f}")
+        else:
+            loss = super().compute_loss(model, inputs, return_outputs=return_outputs)
+        if hasattr(self, "_flops") and self._flops.enabled:
+            _ids = inputs.get("input_ids")
+            _tps = int(_ids.numel()) if _ids is not None else 0
+            _labels = inputs.get("labels")
+            _ln = int(_labels[..., 1:].numel()) if _labels is not None else None
+            self._flops.add_extra_flops(self.model.config, _tps, _ln)
         _DQ()
         if hasattr(self, '_flops') and self._flops.enabled:
             self._last_flops = self._flops.model_training_flops
@@ -1014,7 +1032,7 @@ def train():
     if training_args.npu_profiling:
         if _device_type == "npu":
             lvl = training_args.npu_profiler_level
-            trace_dir = osp.join(training_args.output_dir, "npu_profile" if lvl == 0 else f"npu_profile_level{lvl}")
+            trace_dir = osp.join(osp.abspath(training_args.output_dir), "npu_profile" if lvl == 0 else f"npu_profile_level{lvl}")
             trainer.add_callback(NpuProfilerCallback(trace_dir, lvl))
             print(f"[NpuProfiler] torch_npu profiler level {lvl} active — traces → {trace_dir}")
         else:

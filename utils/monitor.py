@@ -92,8 +92,12 @@ class FlopsCounter:
         self._hooks = []
         self.forward_flops_trainable = 0
         self.forward_flops_frozen = 0
+        self._extra_flops_trainable = 0
         self._peak_tflops = float(os.getenv("DRIVEVLA_PEAK_TFLOPS", "486.354"))
         self._seen_modules = set()
+        self._fused_gateup = os.getenv("EMU3_FUSED_GATEUP", "0") == "1"
+        self._fused_qkv = os.getenv("EMU3_FUSED_QKV", "0") == "1" and os.getenv("EMU3_ATTN_BSH", "0") != "1"
+        self._lm_head_not_hooked = os.getenv("EMU3_LMHEAD_HOOKED", "0") != "1"
 
     def _add(self, module, flops):
         w = getattr(module, "weight", None)
@@ -127,11 +131,38 @@ class FlopsCounter:
     def reset(self):
         self.forward_flops_trainable = 0
         self.forward_flops_frozen = 0
+        self._extra_flops_trainable = 0
         self._seen_modules.clear()
+
+    def add_extra_flops(self, model_config, tokens_per_step, labels_numel=None):
+        """Add analytical FLOPs for fused ops that bypass nn.Linear hooks."""
+        if not self.enabled:
+            return
+        H = model_config.hidden_size
+        I = model_config.intermediate_size
+        V = model_config.vocab_size
+        L = model_config.num_hidden_layers
+        head_dim = H // model_config.num_attention_heads
+        q_dim = model_config.num_attention_heads * head_dim
+        kv_dim = model_config.num_key_value_heads * head_dim
+        rows = tokens_per_step
+        rows_ce = labels_numel if labels_numel else tokens_per_step - 32
+        extra = 0
+        if self._fused_gateup:
+            extra += 2.0 * rows * H * (2 * I) * L
+        if self._fused_qkv:
+            extra += 2.0 * rows * H * (q_dim + 2 * kv_dim) * L
+        if self._lm_head_not_hooked:
+            extra += 2.0 * rows_ce * H * V
+        self._extra_flops_trainable = extra
+        if os.getenv("DRIVEVLA_FLOP_DEBUG") == "1":
+            pct = extra / (self.forward_flops_trainable + extra + 1e-9) * 100
+            print(f"[FLOP_DEBUG] hook={self.forward_flops_trainable:.3e} extra={extra:.3e} ({pct:.1f}%) total={self.forward_flops_trainable+extra:.3e}")
 
     @property
     def model_training_flops(self):
-        return 3.0 * self.forward_flops_trainable + 1.0 * self.forward_flops_frozen
+        return (3.0 * (self.forward_flops_trainable + self._extra_flops_trainable)
+                + 1.0 * self.forward_flops_frozen)
 
     def compute_mfu(self, step_time_sec, num_cards=8):
         """计算MFU
