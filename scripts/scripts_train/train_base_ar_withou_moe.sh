@@ -73,16 +73,68 @@ NO_SAVE_WEIGHTS=false
 NPU_PROFILER_LEVEL=0
 
 # NPU融合算子开关: rms_norm/swiglu/rope/add_rms_norm, 减少kernel launch开销
+# 注: 这4个小算子融合在compute-bound场景实测收益≈0(±0.1% TPS), 保留无害
 export EMU3_NPU_RMSNORM=1
 export EMU3_NPU_SWIGLU=1
 export EMU3_NPU_ROPE=1
 export EMU3_NPU_ADD_RMSNORM=1
 
-# Selective CE: 对lm_head chunked CE用reentrant checkpoint包裹, backward时重算exp()而非保存
-# 消除14.4GB exp中间tensor, 32层GC保持use_reentrant=false(支持torch.compile)
-# 问题场景: chunked_lm_head_cross_entropy的23个chunk产生(40928,8192)的exp中间tensor共14.4GB
-# 开启后HBM从68GB降至58.8GB, TPS从22356提升至43800
-export GC_SELECTIVE_CE=1
+# ============================================================
+# 高收益NPU优化(已验证, y008_200step_final / stage2_mfu_10step)
+#   组合效果: 单步 8.0s→6.91s(-13%), MFU 49.8%→56.6%(+6.8pp), HBM 86.47GB/96GB
+#   所有开关均可用 `export XXX=0` 回退, 便于单变量对照
+# ============================================================
+# [收益最大单项, +6.8pp] Fused CE: 1-pass online logsumexp + Liger单次重算backward
+#   lm_head matmul 3×→1.5×, 免13GB logits物化; 优先级高于GC_SELECTIVE_CE
+#   实测(zero2_noffload, bs32): MFU 49.4→55.9%, TPS 41420→46850, HBM 56GB, 已验证✅
+export EMU3_FUSED_CE=${EMU3_FUSED_CE:-1}
+# CE_ONLINE: 在FUSED_CE基础上选fused-kernel重写(torch.mm out= + logsumexp/logaddexp)
+#   ⚠️ 实测在zero2_noffload+bs32下OOM(aclnnLogSumExp中间张量, 各rank仅剩~1GB), 默认关
+#   显存有富余的场景可 `export EMU3_CE_ONLINE=1` 试; probe估fwd 86→65ms bwd 141→68ms
+export EMU3_CE_ONLINE=${EMU3_CE_ONLINE:-0}
+# Fused gateup/qkv: 合并gate/up与q/k/v权重为单MatMul, 提升Cube利用率, 免cat/transpose
+#   实测(组合): 已验证, 与FUSED_CE一起达MFU 55.9%
+export EMU3_FUSED_GATEUP=${EMU3_FUSED_GATEUP:-1}
+export EMU3_FUSED_QKV=${EMU3_FUSED_QKV:-1}
+# ATTN_BSH: q/k/v保[B,S,H,D] contiguous不transpose, FA以3D BSH调用, 免每层~5个TransposeAiCore kernel
+#   需attn_type=npu_fusion(NPU device下auto自动解析为npu_fusion), 已验证✅
+export EMU3_ATTN_BSH=${EMU3_ATTN_BSH:-1}
+# SAVE_QKV: selective checkpoint MUST_SAVE qkv-proj, backward免重算; bench-confirmed +1.4pp
+#   ⚠️ 实测在GC_SKIP_LAST=6+zero2_noffload+bs32下OOM(HBM 87GB基线+26.8GB累积=>113GB)
+#   但在N=0基线(HBM~57GB, 41GB空闲)下可行: 57+26.8=83.8GB
+#   显存有富余(如关GC_SKIP_LAST)可 `export EMU3_SAVE_QKV=1` 试
+export EMU3_SAVE_QKV=${EMU3_SAVE_QKV:-0}
+# SAVE_DOWN: selective checkpoint MUST_SAVE down_proj mm (input last_dim==intermediate=14336).
+#   down是层内FLOPs/byte最高的mm(FLOPs=2*I*H同gate/up, 但输出336M vs gate/up 1174M => 3.5×FLOPs/byte),
+#   save它以最低HBM代价砍最贵的单mm重算. 需配合GC_SKIP_LAST_LAYERS=0(全selective, 非skip).
+#   N=0基线(57GB)下: 32层down=+10.8GB => ~68GB, 砍1.44×重算(优于GC_skip6的1.0×且更省显存).
+#   可与EMU3_SAVE_QKV=1叠加: +37.6GB => ~94.6GB, 砍2.46×重算(冲高MFU, 临界98GB卡需验).
+export EMU3_SAVE_DOWN=${EMU3_SAVE_DOWN:-0}
+# GC_SKIP_LAST_LAYERS: 末N层不checkpoint(保激活不重算), 缓存换时间.
+#   实测: N=0(全GC) HBM~57GB MFU~50.4%; N=6 HBM~87GB MFU~56.2%(+30GB换+5.8pp).
+#   ⚠️ N=6占用30GB挤掉了selective-save空间(SAVE_QKV因此OOM). 用selective-save替代时设=0.
+#   默认6(当前生产); 调selective-save时 `export GC_SKIP_LAST_LAYERS=0`
+export GC_SKIP_LAST_LAYERS=${GC_SKIP_LAST_LAYERS:-6}
+
+# Selective CE: 对lm_head chunked CE用reentrant checkpoint包裹, backward重算exp()而非保存
+#   仅HBM受限场景(bs6)正向: HBM 68→58.8GB, TPS 22356→43800
+#   ⚠️ bs32 compute-bound场景负收益(-2.2pp MFU), 且FUSED_CE开启时本开关不生效(优先级低)
+#   默认关闭; HBM受限小batch场景可 `export GC_SELECTIVE_CE=1 && export EMU3_FUSED_CE=0`
+export GC_SELECTIVE_CE=${GC_SELECTIVE_CE:-0}
+
+# ============================================================
+# 性能/显存监控(调优必备, 默认开)
+#   DRIVEVLA_MFU_FLAG=1     启用MFU精确计算(forward hook统计FLOPs, 不开则mfu_pct=NA)
+#   DRIVEVLA_MONITOR_HBM=1  启用HBM显存峰值采集
+#   DRIVEVLA_PEAK_TFLOPS    单卡BF16峰值(昇腾默认486.354)
+#   DRIVEVLA_FLOP_DEBUG=1  打印各算子FLOPs占比(可选)
+# 深度profiling: 加 CLI参数 --npu_profiling --npu_profiler_level <0|1|2>
+#   trace落到 ${OUTPUT_DIR}/npu_profile[_levelN], level2含PipeUtilization/l2_cache
+# 精度对齐: msprobe(MindStudio)已装于 /opt/cosmos3_py312, train_moe.py首行 seed_all 固定随机
+# ============================================================
+export DRIVEVLA_MFU_FLAG=${DRIVEVLA_MFU_FLAG:-1}
+export DRIVEVLA_MONITOR_HBM=${DRIVEVLA_MONITOR_HBM:-1}
+export DRIVEVLA_PEAK_TFLOPS=${DRIVEVLA_PEAK_TFLOPS:-486.354}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

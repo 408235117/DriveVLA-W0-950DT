@@ -75,16 +75,69 @@ def fused_add_rms_norm(x, residual, weight, eps):
     With: single npu_add_rms_norm_v2_functional kernel
 
     Returns: (normed_output, residual_out) or None if not enabled
+
+    NOTE: npu_add_rms_norm_v2_functional has NO autograd registration — its
+    fallback backward is identity passthrough (dx=gy, dr=gs) with dw=None, so
+    the post-attention RMSNorm weight gradient is silently dropped. We wrap it
+    in a custom autograd.Function that uses npu_rms_norm_backward in backward:
+      forward : rstd, out, x_back = v2(x, res, w, eps); x_back = res + x
+      backward: (dx_back, dw) = npu_rms_norm_backward(gy, x_back, w, rstd)
+                with dx = dx_back, dr = dx_back (add symmetry)
+    Numerics verified against the standard RMSNorm backward (dw rel 0.0%,
+    dx_back rel 0.2%).
     """
-    if os.getenv("EMU3_NPU_ADD_RMSNORM") != "1":
+    # Accept both EMU3_NPU_ADD_RMSNORM (canonical) and EMU3_NPU_ADD_RMNORM
+    # (the typo used by every shell script in the repo) so the fusion actually
+    # turns on without waiting on a script-wide rename.
+    _add_rms_on = (os.getenv("EMU3_NPU_ADD_RMSNORM") == "1" or
+                   os.getenv("EMU3_NPU_ADD_RMNORM") == "1")
+    if not _add_rms_on:
         return None
+    _dbg = (os.getenv("EMU3_DEBUG_ADD_RMSNORM") or os.getenv("EMU3_DEBUG_ADD_RMNORM"))
     try:
         import torch_npu
-        # v2_functional returns (rstd, output, x_back)
-        # output = RMSNorm(residual + x)
-        rstd, output, x_back = torch_npu.npu_add_rms_norm_v2_functional(x, residual, weight, eps)
-        return output, x_back
+        if not _npu_ready("npu_add_rms_norm_v2_functional") or \
+           not hasattr(torch.ops.npu, "npu_rms_norm_backward"):
+            # No backward op available — fall back to caller's PyTorch path
+            if _dbg:
+                print(f"[NPU][DBG] fused_add_rms_norm FALLBACK (op not ready)")
+            return None
+        if _dbg:
+            print(f"[NPU][DBG] fused_add_rms_norm APPLY (x={tuple(x.shape)} res={tuple(residual.shape)})")
+        return _FusedAddRMSNorm.apply(x, residual, weight, eps)
     except Exception as e:
         print(f"[NPU] fused_add_rms_norm failed: {e}")
         return None
+
+
+class _FusedAddRMSNorm(torch.autograd.Function):
+    """Differentiable fused Add + RMSNorm.
+
+    forward : out = RMSNorm(residual + x); x_back = residual + x
+              returns (out, x_back)
+    backward: (dx_back, dw) = npu_rms_norm_backward(grad_out, x_back, w, rstd)
+              dx = dx_back, dr = dx_back  (because x_back = x + residual)
+    """
+
+    @staticmethod
+    def forward(ctx, x, residual, weight, eps):
+        # v2_functional returns (rstd, output, x_back)
+        rstd, output, x_back = torch_npu.npu_add_rms_norm_v2_functional(
+            x, residual, weight, eps)
+        ctx.save_for_backward(x_back, weight, rstd)
+        return output, x_back
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_x_back):
+        x_back, weight, rstd = ctx.saved_tensors
+        # npu_rms_norm_backward(grad_y, x, gamma, rstd) -> (dx_back, dw)
+        dx_back, dw = torch.ops.npu.npu_rms_norm_backward(
+            grad_output, x_back, weight, rstd)
+        # x_back = x + residual  =>  dx = dx_back, dresidual = dx_back
+        # grad_x_back feeds the residual-out (x_back) consumer; since forward
+        # returned x_back = x + residual, its gradient also flows back to both.
+        dx = dx_back + grad_x_back
+        dr = dx_back + grad_x_back
+        return dx, dr, dw, None
+
 

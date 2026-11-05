@@ -455,7 +455,21 @@ def fused_chunked_linear_cross_entropy(hidden_states, lm_head_weight, labels,
     EMU3_CE_ONLINE=1 selects the fused-kernel rewrite
     OnlineChunkedLinearCrossEntropy (implies the save-logits HBM trade;
     EMU3_FUSED_CE_SAVELOGITS is ignored on that path). Default OFF.
+
+    EMU3_CE_CHUNK_SIZE overrides the vocab chunk size (default 8192). Larger
+    chunks → fewer chunks → fewer per-chunk elementwise kernel launches
+    (amax/exp/sum/gather…), reclaiming host-dispatch idle in the CE region.
+    Each chunk materialises a transient [N, cs] fp32 intermediate, so the
+    HBM cost scales linearly with cs (cs=32768 ≈ +4GiB peak vs 8192 at
+    bs32/seq1280). Pure chunk-boundary re-grouping — numerically identical
+    to the default path.
     """
+    _env_cs = os.environ.get("EMU3_CE_CHUNK_SIZE")
+    if _env_cs:
+        try:
+            chunk_size = int(_env_cs)
+        except ValueError:
+            pass
     if bool(int(os.environ.get("EMU3_CE_ONLINE", "0"))):
         return OnlineChunkedLinearCrossEntropy.apply(
             hidden_states, lm_head_weight, labels, chunk_size, ignore_index, weight)

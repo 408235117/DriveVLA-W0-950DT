@@ -175,7 +175,18 @@ if _GC_SKIP_LAST > 0:
 # down=(4096,14336) fall through to MUST_RECOMPUTE. o_proj is co-saved (same shape as
 # q_proj; its recompute saving is ~0 but it costs only per-layer freed HBM).
 _GC_SAVE_QKV = _os_ce.environ.get('EMU3_SAVE_QKV', '0') == '1'
-if _GC_SAVE_QKV:
+# Selective-save down_proj: down is the highest FLOPs/byte mm in the layer
+# (FLOPs = 2*I*H, same as gate/up, but output is [.,H]=336M vs gate/up [.,I]=1174M
+#  => 3.5x the FLOPs/byte of any other mm). Saving it skips the single most
+#  expensive recompute per layer at the lowest HBM cost. down_proj is uniquely
+#  identified by mm/matmul/linear INPUT last_dim == intermediate_size (14336):
+#  gate/up/fused-gateup all take input last_dim == hidden (4096), so this never
+#  collides. Under N=0 baseline (no GC-skip-last, ~57GB HBM, 41GB free), 32-layer
+#  down save = +10.8GB => ~68GB peak, well within budget.
+_GC_SAVE_DOWN = _os_ce.environ.get('EMU3_SAVE_DOWN', '0') == '1'
+# intermediate_size for down_proj input detection (config.intermediate_size).
+_GC_SAVE_INTERMEDIATE = int(_os_ce.environ.get('EMU3_SAVE_INTERMEDIATE', '14336'))
+if _GC_SAVE_QKV or _GC_SAVE_DOWN:
     import functools as _ft_sq
     from torch.utils.checkpoint import CheckpointPolicy as _CP2, create_selective_checkpoint_contexts as _cscc2
     # Match qkv-proj weights by SORTED dims so it is robust to weight orientation: F.linear
@@ -199,17 +210,29 @@ if _GC_SAVE_QKV:
             return _CP2.MUST_RECOMPUTE
         if op not in _QKV_MM_OPS:
             return _CP2.MUST_RECOMPUTE
-        # weight tensor location differs by op: mm/matmul/linear -> a[1]; addmm -> a[2]
-        if op == torch.ops.aten.addmm.default:
-            w = a[2] if len(a) > 2 else None
-        else:
-            w = a[1] if len(a) > 1 else None
-        if w is not None and getattr(w, 'ndim', 0) == 2 \
-                and tuple(sorted(tuple(w.shape))) in _SAVE_QKV_SORTED:
-            return _CP2.MUST_SAVE
+        # down_proj: F.linear(x, W) with x[..., intermediate_size] -> MUST_SAVE.
+        # Highest FLOPs/byte mm; input last_dim uniquely identifies it (gate/up
+        # take input last_dim == hidden, never intermediate). a[0] is the mm input
+        # for mm/matmul/linear; for addmm a[0] is input too (a[1]=weight, a[2]=weight).
+        if _GC_SAVE_DOWN:
+            _x = a[0] if len(a) > 0 else None
+            if _x is not None and getattr(_x, 'ndim', 0) >= 2 \
+                    and _x.shape[-1] == _GC_SAVE_INTERMEDIATE:
+                return _CP2.MUST_SAVE
+        # qkvo proj: identify by weight sorted shape.
+        if _GC_SAVE_QKV:
+            # weight tensor location differs by op: mm/matmul/linear -> a[1]; addmm -> a[2]
+            if op == torch.ops.aten.addmm.default:
+                w = a[2] if len(a) > 2 else None
+            else:
+                w = a[1] if len(a) > 1 else None
+            if w is not None and getattr(w, 'ndim', 0) == 2 \
+                    and tuple(sorted(tuple(w.shape))) in _SAVE_QKV_SORTED:
+                return _CP2.MUST_SAVE
         return _CP2.MUST_RECOMPUTE
     _save_qkv_ctx_fn = _ft_sq.partial(_cscc2, _save_qkv_policy)
-    print('[GC] Selective checkpoint save-qkv enabled (skip qkv-proj forward recompute in backward)')
+    print(f'[GC] Selective checkpoint save enabled: qkv={_GC_SAVE_QKV} down={_GC_SAVE_DOWN} '
+          f'(intermediate={_GC_SAVE_INTERMEDIATE})')
 # ===== End =====
 
 # ===== Cross-layer fused residual chain (EMU3_FUSED_RESIDUAL_CHAIN) =====
@@ -1625,12 +1648,11 @@ class Emu3Model(Emu3PreTrainedModel):
             _use_ckpt = (self.gradient_checkpointing and self.training
                          and not (layer_idx >= _num_layers - _GC_SKIP_LAST))
             if _use_ckpt:
-                if _GC_SAVE_QKV:
-                    # Selective-checkpoint: MUST_SAVE qkv-proj mm, MUST_RECOMPUTE the
-                    # rest (FA, mlp mm). Backward skips the qkv-proj forward recompute
-                    # (bench-confirmed ~+1.4pp). context_fn (selective contexts) REQUIRES
-                    # use_reentrant=False — which also matches the baseline GC_KWARGS, so
-                    # save-qkv is the only variable vs the candidate-1 baseline.
+                if _GC_SAVE_QKV or _GC_SAVE_DOWN:
+                    # Selective-checkpoint: MUST_SAVE qkv-proj and/or down-proj mm
+                    # (per _save_qkv_policy), MUST_RECOMPUTE the rest (FA, gate/up mm,
+                    # elementwise). Backward skips those mm recomputes. context_fn
+                    # (selective contexts) REQUIRES use_reentrant=False.
                     layer_outputs = torch.utils.checkpoint.checkpoint(
                         decoder_layer.__call__,
                         hidden_states,

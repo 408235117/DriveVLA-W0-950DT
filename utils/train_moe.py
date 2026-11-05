@@ -253,6 +253,26 @@ class NpuProfilerCallback(TrainerCallback):
         self._prof = None
 
     def _build(self):
+        if self._level >= 2:
+            return torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                with_stack=False,
+                record_shapes=True,
+                profile_memory=False,
+                schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=20, repeat=1, skip_first=0),
+                experimental_config=torch_npu.profiler._ExperimentalConfig(
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                    aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                    l2_cache=True,
+                    op_attr=False,
+                    gc_detect_threshold=10,
+                    data_simplification=False,
+                ),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(self._trace_dir),
+            )
         if self._level == 1:
             return torch_npu.profiler.profile(
                 activities=[
@@ -851,6 +871,43 @@ def load_model(model_args, model_config, training_args):
     #      --gradient_checkpointing flag, but we keep use_cache=False
     #      regardless so the model doesn't allocate unused KV buffers.
     model.config.use_cache = False
+
+    # ===== torch.compile (NPU backend) — opt-in via env =====
+    # torch.compile fuses adjacent small ops (Add/Cast/TensorMove/elementwise chains)
+    # into larger execution units, cutting kernel-launch + memory-traffic overhead
+    # that the prof identified as ~6% of the compute stream. NPU backend "npu"
+    # (torch_npu registered) and "npugraphs" (cudagraphs-equivalent) are available.
+    # GC compatibility: use_reentrant=False checkpoint forwards are themselves
+    # re-run in backward; compiling the layer forward accelerates BOTH the original
+    # forward and the recompute. DeepSpeed ZeRO-2 wraps parameters but the module
+    # call graph is still compilable.
+    # Risks: custom autograd.Function (_FusedAddRMSNorm), monkey-patched attn,
+    # dynamic shapes (variable seq len). Mode="default" is safest; "reduce-overhead"
+    # uses cudagraphs (npugraphs) which needs static shapes.
+    _tc_mode = os.environ.get('EMU3_TORCH_COMPILE', '0')  # 0=off, default, reduce-overhead
+    if _tc_mode != '0':
+        # Compile the decoder backbone ONLY (model.model), not lm_head/CE — the
+        # fused chunked CE uses aten.amax.default which the NPU ge backend doesn't
+        # convert (NotImplementedError). The backbone holds the Add/Cast/elementwise
+        # chains + the GC-recompute path that fusion accelerates. lm_head/CE/action
+        # heads stay eager. GC(use_reentrant=False) re-runs the layer forward in
+        # backward, so compiling the layer accelerates both fwd and recompute.
+        _tc_backend = os.environ.get('EMU3_TORCH_COMPILE_BACKEND', 'npu')
+        _tc_kwargs = {}
+        if _tc_mode in ('default', 'reduce-overhead', 'max-autotune'):
+            _tc_kwargs['mode'] = _tc_mode
+        try:
+            # Compile the transformer trunk; leave lm_head / action heads eager.
+            _backbone = getattr(model, 'model', None) or model
+            # Emu3MoE: model.model is the Emu3Model trunk (layers + embed + final norm).
+            _compiled_backbone = torch.compile(_backbone, backend=_tc_backend, **_tc_kwargs)
+            if getattr(model, 'model', None) is not None:
+                model.model = _compiled_backbone
+            print(f"[COMPILE] torch.compile enabled: backend={_tc_backend} mode={_tc_kwargs.get('mode','default')} "
+                  f"scope=model.model (backbone only, lm_head/CE eager)")
+        except Exception as e:
+            print(f"[COMPILE] torch.compile FAILED ({type(e).__name__}): {e}")
+    # ===== End =====
 
     return model
 
